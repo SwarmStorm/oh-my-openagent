@@ -78,12 +78,16 @@ function scrubbedEnv() {
   return Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(OMO|SENPI|PI)_/.test(key)))
 }
 
-function runScenario({ name, permission, steps }) {
+function runScenario({ name, permission, steps, computer = {} }) {
   const sandbox = createSandbox()
   try {
     seedSandbox(sandbox)
     mkdirSync(join(sandbox.cwd, ".omo"), { recursive: true })
-    writeFileSync(join(sandbox.cwd, ".omo", "omo.jsonc"), JSON.stringify({ computer: { engine_path: enginePath, allow_host_relay_only_stop: true } }))
+    writeFileSync(
+      join(sandbox.cwd, ".omo", "omo.jsonc"),
+      JSON.stringify({ computer: { engine_path: enginePath, allow_host_relay_only_stop: true, ...computer } }),
+    )
+    writeFileSync(join(sandbox.cwd, "mock-record-tools"), "")
     writeFileSync(join(sandbox.cwd, "mock-script.json"), `${JSON.stringify({ steps }, null, 2)}\n`)
     const args = ["-e", mockProviderEntry, "-p", "--provider", "omo-mock", "--model", "mock-1"]
     if (permission !== undefined) args.push("--permission", permission)
@@ -109,13 +113,15 @@ function runScenario({ name, permission, steps }) {
     })
     const results = toolResults(sandbox.agentDir)
     const methods = auditMethods(sandbox.root)
+    const toolsFile = join(sandbox.cwd, "mock-tools.jsonl")
+    const declaredTools = existsSync(toolsFile) ? jsonLines(toolsFile) : []
     if (evidenceDir !== undefined) {
       writeFileSync(
         join(evidenceDir, `${name}.json`),
-        `${JSON.stringify({ exit: run.status, stdout: run.stdout, stderr: run.stderr.slice(-4000), results, methods }, null, 2)}\n`,
+        `${JSON.stringify({ exit: run.status, stdout: run.stdout, stderr: run.stderr.slice(-4000), results, methods, declaredTools }, null, 2)}\n`,
       )
     }
-    return { exit: run.status, results, methods, stderr: run.stderr }
+    return { exit: run.status, results, methods, declaredTools, stderr: run.stderr }
   } finally {
     rmSync(sandbox.root, { recursive: true, force: true })
   }
@@ -126,7 +132,93 @@ const screenshotChain = { action: "call", chain: [{ method: "screenshot" }] }
 // multi-step sequence is `run` code (a `chain` is one fluent call on a window or element).
 const clickChain = { action: "run", code: "await desktop.screenshot(); await desktop.click(5, 5); return 'clicked'" }
 
+// A per-call display handle: its screenshot and input target display:<id>, never the session default.
+const displayRun = {
+  action: "run",
+  code: "const all = await desktop.display('all'); const two = await desktop.display('2'); const a = await all.screenshot({ silent: true }); const b = await two.screenshot({ silent: true }); await two.click(20, 10); return JSON.stringify({ all: [a.width, a.height], two: [b.width, b.height] })",
+}
+// Zoom recaptures native detail of a region while input stays in the full screenshot's frame.
+const zoomRun = {
+  action: "run",
+  code: "const full = await desktop.screenshot({ silent: true }); const zoom = await desktop.zoom({ x: 0, y: 0, width: full.width / 4, height: full.height / 4 }, { silent: true }); await desktop.click(full.width - 10, full.height - 10); return 'ZOOM ' + [full.width, full.height, zoom.coordinateWidth, zoom.coordinateHeight, zoom.region.width, zoom.region.height, full.sourceWidth, full.sourceHeight, zoom.sourceWidth, zoom.sourceHeight].join(' ')",
+}
+// Observe returns one window frame and its accessibility tree together; later input uses that frame.
+const observeRun = {
+  action: "run",
+  code: "const win = await desktop.window('101'); const seen = await win.observe({ silent: true }); await win.click(5, 5); return 'OBSERVE ' + [seen.frameId, seen.coordinateWidth, seen.coordinateHeight, seen.nodeCount, seen.ax.includes('[ref=e'), seen.truncated].join(' ')",
+}
+const displayShotChain = { action: "call", chain: [{ method: "display", args: ["2"] }, { method: "screenshot" }] }
+const displayClickChain = { action: "call", chain: [{ method: "display", args: ["2"] }, { method: "click", args: [20, 10] }] }
+
 const scenarios = [
+  {
+    name: "observe-returns-one-frame-and-tree",
+    permission: undefined,
+    steps: [
+      { type: "tool_call", name: "computer", arguments: observeRun },
+      { type: "text", text: "done" },
+    ],
+    verify: ({ results, methods }) => {
+      const result = results.find((r) => r.toolName === "computer")
+      const [frameId, width, height, nodes, hasRefs, truncated] = (/OBSERVE (\S+) (\S+) (\S+) (\S+) (\S+) (\S+)/.exec(resultText(result)) ?? []).slice(1)
+      return [
+        ["the observe run succeeded", result?.isError === false],
+        ["the observation carries a window frame", /^\S+$/.test(frameId ?? "") && Number(width) > 0 && Number(height) > 0],
+        ["the observation carries a non-empty tree with refs", Number(nodes) > 0 && hasRefs === "true" && truncated === "false"],
+        ["a click on the observed frame reached the engine", methods.includes("click")],
+      ]
+    },
+  },
+  {
+    name: "zoom-keeps-the-full-input-frame",
+    permission: undefined,
+    steps: [
+      { type: "tool_call", name: "computer", arguments: zoomRun },
+      { type: "text", text: "done" },
+    ],
+    verify: ({ results, methods }) => {
+      const [fw, fh, cw, ch, rw, rh, fsw, fsh, zsw, zsh] = (/ZOOM ([\d. ]+)/.exec(resultText(results.find((r) => r.toolName === "computer")))?.[1] ?? "").trim().split(" ").map(Number)
+      return [
+        ["the zoom run succeeded", results.find((r) => r.toolName === "computer")?.isError === false],
+        ["zoom reports the full screenshot as its input frame", fw > 0 && cw === fw && ch === fh],
+        ["zoom echoes the requested quarter region", rw === fw / 4 && rh === fh / 4],
+        ["zoom recaptured only the region: a quarter of the full native source", zsw === fsw / 4 && zsh === fsh / 4],
+        ["a click at full-frame coordinates after zoom reached the engine", methods.includes("click")],
+      ]
+    },
+  },
+  {
+    name: "display-handles-capture-and-click",
+    permission: undefined,
+    steps: [
+      { type: "tool_call", name: "computer", arguments: displayRun },
+      { type: "text", text: "done" },
+    ],
+    verify: ({ results, methods }) => [
+      ["the display run succeeded", results.find((r) => r.toolName === "computer")?.isError === false],
+      ["display 2 alone is captured at its native 2880x1800", resultText(results.find((r) => r.toolName === "computer")).includes('"two":[2880,1800]')],
+      ["the composite spans both displays", resultText(results.find((r) => r.toolName === "computer")).includes('"all":[3840,1440]')],
+      ["the click on display 2 reached the engine", methods.includes("click")],
+    ],
+  },
+  {
+    // Read and exec tiers apply per display call: under exec=deny a display screenshot runs, its click does not.
+    name: "display-chains-split-by-tier-under-exec-deny",
+    permission: "computer:exec=deny",
+    steps: [
+      { type: "tool_call", name: "computer", arguments: displayShotChain },
+      { type: "tool_call", name: "computer", arguments: displayClickChain },
+      { type: "text", text: "done" },
+    ],
+    verify: ({ results, methods }) => {
+      const [shot, click] = results.filter((r) => r.toolName === "computer")
+      return [
+        ["the display 2 screenshot ran", shot?.isError === false && resultText(shot).includes('"frameId"')],
+        ["the display 2 click was refused", click?.isError === true],
+        ["no click reached the engine", !methods.includes("click")],
+      ]
+    },
+  },
   {
     name: "read-allowed-under-exec-deny",
     permission: "computer:exec=deny",
@@ -191,6 +283,22 @@ const scenarios = [
       ["tool_search returns computer", resultText(results.find((r) => r.toolName === "tool_search")).includes("computer")],
       ["the searched tool runs by name", results.find((r) => r.toolName === "computer")?.isError === false],
       ["eval then sees the computer global", resultText(results.find((r) => r.toolName === "eval")).includes("object")],
+    ],
+  },
+  {
+    // Providers without native deferred-tool search reach a tool only once it is active (#9048).
+    name: "cua-adapter-activates-computer-actions",
+    permission: undefined,
+    computer: { cua_adapter: true },
+    steps: [
+      { type: "tool_call", name: "computer", arguments: screenshotChain },
+      { type: "tool_call", name: "computer_actions", arguments: { action: "screenshot" } },
+      { type: "text", text: "done" },
+    ],
+    verify: ({ results, declaredTools }) => [
+      ["computer_actions is not declared before activation", declaredTools[0]?.includes("computer_actions") === false],
+      ["activation declares computer_actions on the next request", declaredTools[1]?.includes("computer_actions") === true],
+      ["the computer_actions call succeeded", results.find((r) => r.toolName === "computer_actions")?.isError === false],
     ],
   },
 ]

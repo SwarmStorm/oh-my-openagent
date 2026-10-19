@@ -1,0 +1,28 @@
+From 6ce874755102e8c99463d9cca44868f13b6e141b Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 12 Sep 2026 03:58:26 +0300
+Subject: [PATCH] fix(todo-continuation): align progress type import
+
+(cherry picked from commit da864d084504ceaac3221a20951e12c3da048f7c)
+---
+ .../src/hooks/todo-continuation-enforcer/idle-event.test.ts   | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+index af6530b72..426621e8f 100644
+--- a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
++++ b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+@@ -4,8 +4,8 @@ import { describe, expect, it } from "bun:test"
+ 
+ import { FAILURE_RESET_WINDOW_MS, MAX_CONSECUTIVE_FAILURES } from "./constants"
+ import { handleSessionIdle } from "./idle-event"
+-import type { SessionStateStore } from "./session-state"
+-import type { ContinuationProgressUpdate, SessionState } from "./types"
++import type { ContinuationProgressUpdate, SessionStateStore } from "./session-state"
++import type { SessionState } from "./types"
+ 
+ function createStateStore(): {
+   store: SessionStateStore
+-- 
+2.55.0.windows.3
+

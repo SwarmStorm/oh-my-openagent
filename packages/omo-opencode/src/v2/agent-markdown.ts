@@ -2,8 +2,17 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { getOpenCodeConfigDir } from "../shared/opencode-config-dir"
+import { log } from "../shared/logger"
 
 const AGENT_DIRECTORY = "oh-my-openagent"
+
+/**
+ * Stamp written into every agent file this module owns. `writeAgentMarkdown` only ever
+ * overwrites files carrying it, so a hand-authored agent (or a config override such as a
+ * user-pinned explore.md) is never clobbered — the same "user config wins" outcome the v1
+ * plugin surface had.
+ */
+const GENERATED_MARKER = "generated-by: oh-my-openagent"
 
 export type AgentPermissionEffect = "allow" | "deny" | "ask"
 
@@ -19,7 +28,11 @@ const ACTION_ALIASES: Record<string, string> = {
 
 export function agentMarkdownDirectory(override?: string): string {
   if (override) return override
-  return join(getOpenCodeConfigDir({ binary: "opencode" }), "agents", AGENT_DIRECTORY)
+  // Written FLAT into agents/ so opencode registers each agent under its bare id
+  // ("Sisyphus - ultraworker"), exactly like the v1 plugin surface did. The previous
+  // layout (agents/oh-my-openagent/<name>.md) made every id "oh-my-openagent/<name>",
+  // which broke default_agent, every existing session, and the agent picker.
+  return join(getOpenCodeConfigDir({ binary: "opencode" }), "agents")
 }
 
 export function agentFileName(name: string): string {
@@ -77,7 +90,7 @@ export function renderAgentMarkdown(name: string, config: Record<string, unknown
       : undefined
   if (prompt === undefined && typeof config.description !== "string") return undefined
 
-  const lines = ["---"]
+  const lines = ["---", `# ${GENERATED_MARKER}`]
   if (typeof config.description === "string") lines.push(`description: ${yamlString(config.description)}`)
   const mode = agentMode(config.mode)
   if (mode) lines.push(`mode: ${mode}`)
@@ -101,6 +114,9 @@ export function renderAgentMarkdown(name: string, config: Record<string, unknown
   return `${lines.join("\n")}`
 }
 
+/** Windows and macOS resolve "Sisyphus-Junior.md" and "sisyphus-junior.md" to one file. */
+const CASE_INSENSITIVE_AGENT_PATHS = process.platform === "win32" || process.platform === "darwin"
+
 export type WrittenAgent = {
   name: string
   id: string
@@ -111,22 +127,56 @@ export type WrittenAgent = {
 export function writeAgentMarkdown(input: {
   directory: string
   agents: Record<string, unknown>
+  caseInsensitivePaths?: boolean
 }): WrittenAgent[] {
   mkdirSync(input.directory, { recursive: true })
-  const written: WrittenAgent[] = []
+  const caseInsensitivePaths = input.caseInsensitivePaths ?? CASE_INSENSITIVE_AGENT_PATHS
+  const pathKey = (path: string) => (caseInsensitivePaths ? path.toLowerCase() : path)
+  const pending: Array<{ name: string; path: string; markdown: string }> = []
   for (const [name, value] of Object.entries(input.agents)) {
     if (!isRecord(value) || value.disable === true || value.disabled === true) continue
     const markdown = renderAgentMarkdown(name, value)
     if (!markdown) continue
-    const path = join(input.directory, agentFileName(name))
-    let changed = true
-    try {
-      changed = readFileSync(path, "utf8") !== markdown
-    } catch {
-      changed = true
+    pending.push({ name, path: join(input.directory, agentFileName(name)), markdown })
+  }
+  // A display name and its hidden config-key alias can differ only by case
+  // ("Sisyphus-Junior" / "sisyphus-junior"). On a case-insensitive filesystem both resolve to
+  // one file, so writing each in turn flips the file on every boot. The last entry owns it.
+  const owner = new Map<string, string>()
+  for (const agent of pending) owner.set(pathKey(agent.path), agent.name)
+
+  const written: WrittenAgent[] = []
+  const aliases: Array<{ name: string; path: string }> = []
+  for (const { name, path, markdown } of pending) {
+    if (owner.get(pathKey(path)) !== name) {
+      log("agent file name collides ignoring case; another entry owns the file", {
+        name,
+        owner: owner.get(pathKey(path)),
+        path,
+      })
+      aliases.push({ name, path })
+      continue
     }
+    let existing: string | undefined
+    try {
+      existing = readFileSync(path, "utf8")
+    } catch {
+      existing = undefined
+    }
+    if (existing !== undefined && !existing.includes(GENERATED_MARKER)) {
+      // A hand-authored agent owns this file; never overwrite it. The v1 surface let the
+      // user's config win the same way, and their model pins must survive regressions.
+      log("agent file is user-authored; not overwriting", { name, path })
+      continue
+    }
+    const changed = existing === undefined || existing !== markdown
     if (changed) writeFileSync(path, markdown)
-    written.push({ name, id: nestedAgentID(name), path, changed })
+    written.push({ name, id: name, path, changed })
+  }
+  // An alias shares its owner's file, so it is registered only when the owner was.
+  for (const alias of aliases) {
+    if (!written.some((agent) => pathKey(agent.path) === pathKey(alias.path))) continue
+    written.push({ name: alias.name, id: alias.name, path: alias.path, changed: false })
   }
   return written
 }

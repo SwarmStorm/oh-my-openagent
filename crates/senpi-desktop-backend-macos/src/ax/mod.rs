@@ -3,27 +3,84 @@
 //! core's `AxRegistry`.
 
 mod actions;
+mod date;
+mod foreground;
+pub(crate) mod menus;
+mod point_owner;
+mod popup;
 pub(crate) mod element;
 mod props;
 mod tree;
 
-use senpi_desktop_core::ax::{AxBackend, AxHandle, AxProps};
+use senpi_desktop_core::ax::{AxBackend, AxHandle, AxOwner, AxProps};
 use senpi_desktop_core::error::CoreResult;
 use senpi_desktop_core::types::DesktopWindow;
 
 pub use self::element::is_trusted;
+pub(crate) use self::foreground::{make_frontmost, prepare_foreground_input};
+pub(crate) use self::point_owner::ensure_points_owned;
 use self::element::{element, handle};
 
 #[derive(Debug, Default)]
-pub struct MacAx;
+pub struct MacAx {
+    overlay: crate::overlay::Overlay,
+}
 
 impl MacAx {
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn with_overlay(overlay: crate::overlay::Overlay) -> Self {
+        Self { overlay }
+    }
+
+    fn show_target(&self, h: &AxHandle) {
+        if !self.overlay.available() {
+            return;
+        }
+        if let Ok(element) = element(h) {
+            if let Some(bounds) = element::bounds(element) {
+                self.overlay.target(bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0);
+            }
+        }
+    }
+
+    pub(crate) fn show_typing_target(&self, window: &DesktopWindow) {
+        if !self.overlay.available() {
+            return;
+        }
+        let focused = window.pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(|pid| element::create_application(pid).ok())
+            .and_then(|app| {
+                element::set_timeout(&app).ok()?;
+                element::copy_element(&app, "AXFocusedUIElement")
+            })
+            .and_then(|focused| {
+                element::set_timeout(&focused).ok()?;
+                Some(focused)
+            });
+        if let Some(focused) = focused {
+            if element::owner_window_id(&focused).map(|id| id.to_string()).as_deref() == Some(window.id.as_str()) {
+                if let Some(bounds) = element::bounds(&focused) {
+                    self.overlay.target(bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0);
+                    return;
+                }
+            }
+        }
+        self.overlay.target(
+            f64::from(window.x) + f64::from(window.width) / 2.0,
+            f64::from(window.y) + f64::from(window.height) / 2.0,
+        );
     }
 
     /// `AXRaise` on the window's AX root; the `raise_window` primitive.
     pub fn raise(&mut self, window: &DesktopWindow) -> CoreResult<()> {
+        self.overlay.target(
+            f64::from(window.x) + f64::from(window.width) / 2.0,
+            f64::from(window.y) + f64::from(window.height) / 2.0,
+        );
         actions::perform(&*tree::window_root(window)?, "AXRaise")
     }
 }
@@ -71,13 +128,6 @@ pub(crate) fn text_area_value(window: &DesktopWindow) -> Option<String> {
     None
 }
 
-/// Raises `window` and marks it main/focused so a foreground action lands in
-/// it (oh-my-pi's `prepare_foreground_input`).
-pub(crate) fn prepare_foreground_input(window: &DesktopWindow) -> CoreResult<()> {
-    let root = tree::window_root(window)?;
-    actions::set_window_main_and_focused(&root)?;
-    actions::perform(&root, "AXRaise")
-}
 
 impl AxBackend for MacAx {
     fn window_root(&mut self, win: &DesktopWindow) -> CoreResult<AxHandle> {
@@ -97,14 +147,17 @@ impl AxBackend for MacAx {
     }
 
     fn perform(&mut self, h: &AxHandle, action: &str) -> CoreResult<()> {
+        self.show_target(h);
         actions::perform(element(h)?, action)
     }
 
     fn set_value(&mut self, h: &AxHandle, value: &str) -> CoreResult<()> {
+        self.show_target(h);
         actions::set_value(element(h)?, value)
     }
 
     fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
+        self.show_target(h);
         actions::focus(element(h)?)
     }
 
@@ -118,6 +171,12 @@ impl AxBackend for MacAx {
 
     fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>> {
         tree::attributes(element(h)?)
+    }
+
+    /// `AXWindow`'s CGWindowID: the id `windows()` lists.
+    fn owner(&mut self, h: &AxHandle, _windows: &[DesktopWindow]) -> CoreResult<AxOwner> {
+        Ok(element::owner_window_id(element(h)?)
+            .map_or(AxOwner::Unknown, |id| AxOwner::Window(id.to_string())))
     }
 }
 

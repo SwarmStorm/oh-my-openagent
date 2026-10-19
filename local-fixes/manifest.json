@@ -1,0 +1,843 @@
+{
+  "version": 1,
+  "purpose": "Every local OMO fix we own, in dependency order. Applied automatically by local-fixes/apply.mjs after an OMO update so a rebuilt dist always contains all of them.",
+  "repo": "oh-my-openagent-fix",
+  "appliesTo": "packages/omo-opencode",
+  "bundleBranch": "integration/opencode-v2",
+  "build": {
+    "command": "bun run build",
+    "artifact": "dist/index.js"
+  },
+  "fixes": [
+    {
+      "id": "01-hijack-autocontinue-reroute",
+      "title": "Post-compaction auto-continue no longer inherits the compaction model",
+      "commit": "65d39d20d",
+      "patch": "patches/01-hijack-autocontinue-reroute.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8397",
+      "why": "OpenCode's synthetic post-compaction continue inherited the summarize request's model, so an agent whose compaction.model differs from the running model made the compaction model continue the task.",
+      "markers": [
+        "compaction-autocontinue-reroute",
+        "pickActiveSessionMessage"
+      ],
+      "overlapsWith": [
+        "02-hijack-working-model"
+      ],
+      "orderNote": "Adds plugin/compaction-autocontinue-reroute.ts. 02 refines the same file, so 02 must come after 01."
+    },
+    {
+      "id": "02-hijack-working-model",
+      "title": "Resolve the continue's working model from the last real assistant turn",
+      "commit": "7cb33a77c",
+      "patch": "patches/02-hijack-working-model.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8397",
+      "why": "The first fix resolved 'working model' from the newest message carrying agent+model fields, which matched compaction summaries and the internal compaction_continue prompts themselves — a self-sustaining loop that silently switched live sessions to the summarizer model.",
+      "markers": [
+        "isInternalContinuationMessage",
+        "pickActiveSessionMessage"
+      ],
+      "overlapsWith": [
+        "01-hijack-autocontinue-reroute"
+      ],
+      "orderNote": "Modifies the file added by 01. Keep after 01."
+    },
+    {
+      "id": "03-empty-summary-guard",
+      "title": "Keep the admission guard after a timed-out summarize; reject empty summaries",
+      "commit": "64987f992",
+      "patch": "patches/03-empty-summary-guard.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8473",
+      "why": "An abandoned summarize never latched the session, so the next tool call after the cooldown recomputed the ratio from the stale pre-compaction measurement and started another compaction; one fired at a real fill of 7 percent.",
+      "markers": [
+        "Compaction produced an empty summary"
+      ],
+      "overlapsWith": [
+        "04-compaction-pin-resolution"
+      ],
+      "orderNote": "Touches preemptive-compaction-trigger.ts, which 04 also rewrites. Keep 03 before 04."
+    },
+    {
+      "id": "04-compaction-pin-resolution",
+      "title": "Make the summarizer pin resolve, log why, and never deadlock",
+      "commit": "06aef99f5",
+      "patch": "patches/04-compaction-pin-resolution.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8511",
+      "why": "agents.<key>.compaction.model silently fell back to the session model on every failure path with no logging, and the failure log printed the SESSION model — a dead pin looked exactly like a working one. Four production compactions ran on the session model while the config pinned GLM.",
+      "markers": [
+        "summarize model resolved",
+        "releasing a stalled summarize guard",
+        "no-compaction-pin"
+      ],
+      "overlapsWith": [
+        "03-empty-summary-guard"
+      ],
+      "orderNote": "This is the local-lineage form, which builds on 03's empty-summary module. PR #8511 ships an equivalent port written against dev (commit eb15543ea) that does not depend on 03 — if 03 ever merges upstream, prefer that one instead. Keep after 03.",
+      "portCommit": "eb15543ea"
+    },
+    {
+      "id": "05-background-agent-liveness",
+      "title": "Stop stranding background tasks when activity reads fail",
+      "commit": "af6461926",
+      "patch": "patches/05-background-agent-liveness.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8512",
+      "why": "session-activity.ts detached an SDK method (const sessionGet = client.session.get), so this._client was undefined and every read degraded to unavailable — which suppresses stale interruption — with no completion watchdog. Two review tasks stranded for six hours.",
+      "markers": [
+        "Task exceeded the hard deadline"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-04. Safe anywhere in the order."
+    },
+    {
+      "id": "06-provider-retry-bound",
+      "title": "Bound provider-error continuation retries",
+      "commit": "91c4151a6",
+      "patch": "patches/06-provider-retry-bound.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/7490",
+      "why": "A retryable provider error (HTTP 503) let the todo-continuation enforcer re-dispatch indefinitely, burning tokens against a provider that was down. Adds isRetryableProviderError() and bounds consecutive retries.",
+      "markers": [
+        "isRetryableProviderError"
+      ],
+      "overlapsWith": [
+        "07-pause-after-provider-failure",
+        "08-preserve-failure-streak"
+      ],
+      "orderNote": "Adds the handler/session-state/types surface that 07 and 08 build on. Keep first."
+    },
+    {
+      "id": "07-pause-after-provider-failure",
+      "title": "Pause continuation after repeated provider failures",
+      "commit": "467366fca",
+      "patch": "patches/07-pause-after-provider-failure.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/7490",
+      "why": "Continuation kept firing after the provider had already failed repeatedly. Idle events now consult the provider-failure boundary and honour the recovery window instead of resuming immediately.",
+      "markers": [
+        "failureResetWindowElapsed"
+      ],
+      "overlapsWith": [
+        "06-provider-retry-bound",
+        "08-preserve-failure-streak"
+      ],
+      "orderNote": "Depends on 06's session-state fields. Keep after 06."
+    },
+    {
+      "id": "08-preserve-failure-streak",
+      "title": "Preserve the provider failure streak across non-idle events",
+      "commit": "e7516468f",
+      "patch": "patches/08-preserve-failure-streak.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/7490",
+      "why": "Non-idle events reset consecutiveProviderFailures to 0, so any unrelated event defeated the retry bound added by 06 and the failure loop continued.",
+      "markers": [
+        "consecutiveProviderFailures"
+      ],
+      "overlapsWith": [
+        "06-provider-retry-bound"
+      ],
+      "orderNote": "Touches non-idle-events.ts only. Keep after 06."
+    },
+    {
+      "id": "09-progress-type-import",
+      "title": "Align the continuation progress type import",
+      "commit": "6ce874755",
+      "patch": "patches/09-progress-type-import.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/7490",
+      "why": "Type-only fix: ContinuationProgressUpdate and SessionStateStore were imported from the wrong modules, so the 07/08 surface failed typecheck.",
+      "markers": [],
+      "overlapsWith": [
+        "07-pause-after-provider-failure"
+      ],
+      "orderNote": "Import alignment for the 07/08 surface. Keep after 08. Deliberately has NO markers: it only touches a test file and a type-only import, both erased before bundling, so no string from it can ever appear in dist/index.js and a marker would make the step-4 bundle check fail forever. Applied by cherry-pick; not bundle-verifiable by design."
+    },
+    {
+      "id": "10-first-prompt-watchdog",
+      "title": "Extend the first-prompt watchdog so a slow first token can arrive",
+      "commit": "580bcd571",
+      "patch": "patches/10-first-prompt-watchdog.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8167",
+      "why": "The runtime-fallback watchdog fired before a slow provider produced its first token, swapping out a healthy-but-slow model mid-request. Raises the default to 180s.",
+      "markers": [
+        "DEFAULT_FIRST_PROMPT_WATCHDOG_MS"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 06-09. Covered by PR #8167, whose title mentions only the cancellation race and never the watchdog - do NOT judge coverage by title. Its commit there is d63e1baef."
+    },
+    {
+      "id": "11-cancel-explicit-state",
+      "title": "Track explicit cancellation state on a task",
+      "commit": "f6b43a05a",
+      "patch": "patches/11-cancel-explicit-state.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8167",
+      "why": "Adds cancellationRequested to the background task type so the manager can tell a real user cancel apart from an idle-event race.",
+      "markers": [
+        "cancellationRequested"
+      ],
+      "overlapsWith": [
+        "12-cancel-lifecycle-events"
+      ],
+      "orderNote": "Types-only change that 12 consumes. Keep before 12. Covered by PR #8167 (commit 100715c38) together with 12."
+    },
+    {
+      "id": "12-cancel-lifecycle-events",
+      "title": "Preserve background-agent lifecycle events during cancellation",
+      "commit": "168e72192",
+      "patch": "patches/12-cancel-lifecycle-events.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/8167",
+      "why": "A cancellation racing an idle event dropped the task's terminal lifecycle events, so downstream consumers never observed the task finishing. Defers, replays, or discards them deterministically instead.",
+      "markers": [
+        "deferCancellationEvent",
+        "replayCancellationEvents",
+        "discardCancellationEvents"
+      ],
+      "overlapsWith": [
+        "11-cancel-explicit-state"
+      ],
+      "orderNote": "Depends on 11's cancellationRequested field. Keep last. Covered by PR #8167 (commit 924555133), which also carries 11 in dependency order."
+    },
+    {
+      "id": "13-compaction-pin-checkpoint",
+      "title": "Checkpoint capture skips the active compaction pin model",
+      "commit": "85e32de939e72ebdccfe3a4b731ab96404c834e4",
+      "patch": "patches/13-compaction-pin-checkpoint.patch",
+      "why": "The compaction-context-injector snapshots the session model before compaction. A compaction marker/summary row tagged with the WORKING agent (not agent=compaction) carries the summarizer pin model (glm-5.3-flash), which every existing exclusion let through - resolveValidatedModel skipped only agent===compaction. The checkpoint then re-injected the pin as the session model after compaction, hijacking continuation onto the summarizer (observed 2026-09-27T20:52Z, ses_f22570befffeKtPFEZc6tHsCBM: kimi session continued on glm-5.3-flash). Fix: preemptive-compaction-trigger records the summarize target in compaction-pin-state; the checkpoint resolver and its stored-model fallback skip any model equal to that pin, so capture keeps the last real working model. Hardened 2026-09-28: deduped imports (tsgo TS2300 x4), restored the 3 resolver tests the original commit deleted, added a guard test for core summary rows on the configured compaction agent (opencode-core-fix compaction-model-override), and regenerated this patch as UTF-8 (was UTF-16LE, unusable by git apply).",
+      "markers": [
+        "compaction-pin-checkpoint"
+      ],
+      "overlapsWith": [
+        "02-hijack-working-model"
+      ],
+      "orderNote": "Independent of 02 (which fixes the reroute side); this fixes the injector side. Apply after 02.",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10211"
+    },
+    {
+      "id": "14-compaction-part-marker",
+      "title": "Marker rows detected by their compaction part, not agent name alone",
+      "commit": "62ecde3d0adf5f00b47180d944b6a6f8a8c8b500",
+      "patch": "patches/14-compaction-part-marker.patch",
+      "why": "A compaction marker row carries the WORKING agent plus a compaction PART, but every exclusion (lifecycle isCompactionMessage, resolver resolveValidatedModel, reroute isCompactionArtifact) checked only the agent NAME. The marker sailed through: its pin model poisoned the stored session model (event-session-lifecycle), became the resolvers current prompt config (session-prompt-config-resolver backward scan + resolveLatestSessionPromptConfig), and vetoed the correct working-model checkpoint (recovery validateCheckpointModel). Observed 2026-09-27T23:37Z ses_f22570: kimi session hijacked to glm-5.3-flash primary after compaction; the injector dispatched the hijack prompt while the reroute correctly reissued kimi. Fix: detect marker rows by their compaction part in all three paths.",
+      "markers": [
+        "compaction-part-marker"
+      ],
+      "overlapsWith": [
+        "13-compaction-pin-checkpoint"
+      ],
+      "orderNote": "Independent of 13 (pin-state guard); this fixes the structural detection. Apply after 13.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10120",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10211"
+    },
+    {
+      "id": "15-opencode-v2-compaction-event-alias",
+      "title": "Bridge v2 compaction/idle event names to the v1 hook surface",
+      "commit": "bce3fe471",
+      "patch": "patches/15-opencode-v2-compaction-event-alias.patch",
+      "pr": null,
+      "why": "OpenCode v2 renamed session.compacted to session.compaction.ended and never emits session.idle, so the v1 event handlers behind fixes 01-04 (token-cache clear, post-compaction monitor, manual-compaction continue) silently never fire on v2. The graft aliases compaction.ended to a v1-shaped session.compacted for v1 event handlers and accepts session.execution.succeeded as the terminal idle signal.",
+      "markers": [
+        "session.execution.succeeded"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Patches packages/omo-opencode/src/v2/hook-bridge.ts, which only exists after PR #9016 merges. Apply last; no interaction with fixes 01-12 (different files). Numbered 15 because the v1 line claimed #14 (compaction-context-injector working-model fix, session ses_f26289d0).",
+      "notOursReference": "https://github.com/code-yeongyu/oh-my-openagent/pull/9016",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10248"
+    },
+    {
+      "id": "16-compaction-loop-breaker",
+      "title": "Break the compaction loop after 2 ineffective rounds; write a handoff note",
+      "commit": "b3941dcbc853b38e8af0608e42464b3b4af57fd8",
+      "patch": "patches/16-compaction-loop-breaker.patch",
+      "why": "On claude-code bridged sessions the bridge keeps its own conversation state: opencode compaction rewrites the DB view (M3 summarize input shrinks 104K->26K->9K) but the continuation prompt stays at the full unreduced size (~780K tokens, cacheRead grows across rounds). Every finished assistant message repopulates the trigger cache with ~780K usage, usageRatio ~= 3.9 vs threshold 0.78, and the trigger re-fires every 60s cooldown forever (ses_f10e47816: six compactions in 14 minutes, round 2 fired 29s after round 1 with ~100 chars of new content). Fix: after 2 consecutive compactions that fail to reduce usage by >=30%, disable preemptive compaction for the session, toast a warning, and write a deterministic plugin-side handoff note (with the last compaction summary) to .omo/handoffs/.",
+      "markers": [
+        "compaction-loop-breaker"
+      ],
+      "overlapsWith": [
+        "13-compaction-pin-checkpoint",
+        "14-compaction-part-marker"
+      ],
+      "orderNote": "Apply after 14. Grafted from the main ledger 2026-10-02; patch path relative to local-fixes/ per v2-int convention.",
+      "upstream": "N/A — environment-specific Claude bridge safety policy: independent unreduced transcript, two-round/30% threshold and local .omo/handoffs policy; not a general OMO compaction fix."
+    },
+    {
+      "id": "18-runtime-fallback-recovery-arbitration",
+      "title": "runtime-fallback owns session.error recovery before the background manager finalizes the task",
+      "commit": "01b3b411ea80234dd268bd472e9a5d11ff302701",
+      "patch": "patches/18-runtime-fallback-recovery-arbitration.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/9683",
+      "why": "A subagent session whose first generation failed (ProviderModelNotFoundError) was retried by runtime-fallback inside the same session and completed hours of work while the caller's background task handle reported error and was treated as dead; two such invisible workers raced one repo (2026-10-06). The event dispatcher runs backgroundNotificationHook (which does not await manager.handleEvent) before runtimeFallback, and runtime-fallback awaits agent resolution before it sets sessionRetryInFlight / sessionAwaitingFallbackResult, so BackgroundManager.handleSessionErrorEvent finalized the task (or started its own replacement session) before there was any retry state to read. Retry prompts can reuse the original user message id, so message ids and retry markers cannot attribute an error to its generation. Each session.error now carries a claim keyed by the event object: the dispatcher opens it before any hook runs, runtime-fallback settles it retry-owned or declined, and the manager awaits it before tryFallbackRetry and terminal finalization. A retry that fails raises a new session.error with its own claim, so it still ends the task. No runtime-fallback hook means no claim and no wait; an unsettled claim resolves declined after 20s.",
+      "markers": [
+        "awaitRuntimeFallbackRecoveryDecision",
+        "openRuntimeFallbackRecoveryClaim",
+        "session.error recovered by runtime-fallback retry; keeping task running"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-17; id 15 remains the v2 compaction-event alias. Ported unchanged from v1 fix 18, source commit fca36ac472e728f4f1af7ac4f22bb3f8d402eb3b and ledger commit 91cc39ed0fa7b144cdb00398be15c202bcca0c95, onto integration/opencode-v2 at OMO 5.1.19 (2026-10-06). Patch bytes are unchanged; path is relative to local-fixes/ per v2-int convention. Touches manager.ts handleSessionErrorEvent, runtime-fallback/hook.ts, plugin/event-hook-dispatcher.ts and adds shared/runtime-fallback-recovery.ts. Upstream: issue #9682, PR #9683. Not covered: delegate-task sync polling (sync-session-turns.ts / sync-result-fetcher.ts) and the manager's own session.status retry path."
+    },
+    {
+      "id": "19-compaction-aware-timeout-lane-guards",
+      "title": "Protect compaction lanes and exhausted fallback retries",
+      "commit": "9a6a40824f893f286eaf3e680e15f5bd4d7f4b58",
+      "patch": "patches/19-compaction-aware-runtime-fallback.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/9787",
+      "why": "The 2026-10-08 incident let the 30s watchdog and retry-signal handlers abort healthy compaction work or native retries without a replacement, leaving sessions dead and advancing the wrong lane.",
+      "markers": [
+        "compaction-aware-timeout",
+        "compaction-lane-retry-ignored",
+        "fallback-exhausted-no-abort"
+      ],
+      "overlapsWith": [
+        "18-runtime-fallback-recovery-arbitration"
+      ],
+      "orderNote": "Adds the shared compaction-in-flight registry and guards timeout, retry-signal, message-update, visible-response, and session.error paths. Apply after 18. The v2 bridge maps session.retry.scheduled to the V1 retry-status shape and deduplicates adjacent dual retry signals; compaction start comes from the bridged compaction hook and raw failure events remain terminal signals."
+    },
+    {
+      "id": "20-retry-source-hygiene",
+      "title": "Reuse the last real user prompt for runtime fallback retries",
+      "commit": "97f96ddcb20a88214c25b15527a341387bd31ead",
+      "patch": "patches/20-retry-source-hygiene.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/9787",
+      "why": "The same incident replayed compaction marker rows and synthetic continue prompts, and bootstrapped the fallback chain from agent config instead of the model on the last real user turn.",
+      "markers": [
+        "retry-payload-skips-compaction-marker",
+        "fallback-bootstrap-from-last-user-model",
+        "watchdog-part-progress-rearm"
+      ],
+      "overlapsWith": [
+        "19-compaction-aware-timeout-lane-guards",
+        "18-runtime-fallback-recovery-arbitration"
+      ],
+      "orderNote": "Refines retry payload selection and bootstrap model resolution after 19; keep after both 18 and 19."
+    },
+    {
+      "id": "21-agent-registration-flat",
+      "title": "Register OMO agents under their bare ids instead of a namespaced subdirectory",
+      "commit": "4f18e252b6268078cfc0ad16641c7f73ec7465ba",
+      "patch": "patches/21-agent-registration-flat.patch",
+      "pr": null,
+      "why": "The v2 port materialised every agent as agents/oh-my-openagent/<name>.md, so opencode derived ids like 'oh-my-openagent/Sisyphus - ultraworker'. default_agent ('Sisyphus - ultraworker'), every v1 session pin, and the agent picker all reference the bare name, so on the v2 lane nothing resolved: 'Session.AgentNotFoundError: Agent not found: \"Sisyphus - ultraworker\"' looped in 'Failed to drain Session' (observed 2026-10-09T20:16Z, run=228135fd) and the picker showed two entries per agent. The port now writes agents flat into agents/ and stamps a generated-by marker, so a hand-authored agent (explore.md pinned to MiniMax M3 for quota, general.md) is never overwritten - the v1 'user config wins' outcome. One-time cleanup after the first flat write: delete the stale agents/oh-my-openagent/ directory; the v2 host never recreates it.",
+      "markers": [
+        "generated-by: oh-my-openagent",
+        "agent file is user-authored; not overwriting"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-20; touches only packages/omo-opencode/src/v2/agent-markdown.ts. Complemented outside this repo by carrying v1's opencode.json agent block and default_agent into the v2 profile config (the cutover dropped both).",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10249"
+    },
+    {
+      "id": "23-skill-v2-ctx-ask-guard",
+      "title": "Guard the legacy skill permission ask when projected into OpenCode v2",
+      "commit": "d117ac603fb02ab74abddea66fd2fe83e075202b",
+      "patch": "patches/23-skill-v2-ctx-ask-guard.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10067",
+      "why": "The V1 skill tool calls ctx.ask, but the v2 host projects it through ctx.tool.transform with a v2 tool context that has no ask(). Optional chaining guards ctx, not a missing method, so every skill load on the v2 lane failed with 'ctx?.ask is not a function' (observed 2026-10-10/11). ask is now called only when the host provides it; a rejection or error from a real ask still propagates, so the V1 gate is unchanged. KNOWN GAP on v2: the per-skill approval prompt is not shown there. The public v2 plugin API has no way to create a permission request from a tool executor (ctx.permission offers list/get/reply/rules and an evaluate hook only), so the skill loads without asking. Each skipped prompt is logged as '[skill] tool context has no ask(); skill permission prompt skipped'. Closing the gap needs a native v2 skill tool with Permission.Service.assert, or a public v2 permission-assert API.",
+      "markers": [
+        "tool context has no ask(); skill permission prompt skipped"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-22; touches only packages/omo-opencode/src/tools/skill/tools.ts and its factory test. The marker is the runtime log string, not the typeof guard, so it survives bundling regardless of how the bundler prints the comparison. pr is null because the v2 host (src/v2) is not in upstream dev; the defect is unreachable in released upstream builds.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10068"
+    },
+    {
+      "id": "24-agent-writer-self-ingest",
+      "title": "Stop the v2 agent writer from rewriting its own output on every boot",
+      "commit": "4de313c86c324ad40c265c0f7299a6608411b3ae",
+      "patch": "patches/24-agent-writer-self-ingest.patch",
+      "pr": null,
+      "why": "After fix 21 wrote agents flat into the global agents dir, the plugin rewrote four files at every plugin init (ocBuilder.md, OpenCode-Builder.md, codex-teammate.md, Sisyphus-Junior.md), and each write under the config dir triggers the opencode 2.0.25 skill-watcher reload burst (upstream #53393; storm investigation 2026-10-10/11). Three causes: (1) loadOpencodeGlobalAgents re-ingested the files the host had written, so any agent not shadowed by a protected builtin name or a later source came back with one more '(opencode) ' description prefix per boot (ocBuilder is the displayName of OpenCode-Builder and is not a protected name; codex-teammate overrides the ~/.claude/agents original); (2) 'Sisyphus-Junior' and its hidden config-key alias 'sisyphus-junior' map to one file on a case-insensitive filesystem, so it was written twice per boot with and without 'hidden: true'; (3) with the home directory as the project, ~/.claude/agents was loaded again as project agents and relabelled '(project)'. The loader now skips files carrying the generated-by stamp in their frontmatter, a case-colliding file has one owner (the last entry, which keeps the on-disk result unchanged), and the user agents dir is never loaded as project agents.",
+      "markers": [
+        "agent file name collides ignoring case; another entry owns the file",
+        "skipped plugin-generated agent files",
+        "project agents dir is the user agents dir; not loading it twice"
+      ],
+      "overlapsWith": [
+        "21-agent-registration-flat"
+      ],
+      "orderNote": "Must come after 21: it edits writeAgentMarkdown from 21 and relies on the stamp 21 introduced. Two of the three markers live in packages/claude-code-compat-core/src, which is why apply.mjs and verify.mjs search that package as well. An agent file WITHOUT the stamp is user-authored: the writer never overwrites it and the loader still loads it as a custom agent. To hand a file back to the plugin, put '# generated-by: oh-my-openagent' as the first frontmatter line. pr is null: the writer and the stamp exist only on the v2 integration line.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10249"
+    },
+    {
+      "id": "25-v2-todo-tool-schema",
+      "title": "Make v2 todo tools discoverable with complete item schemas and replacement semantics",
+      "commit": "5127c1129344d95c5c9bb417575eebad8db352c6",
+      "patch": "patches/25-v2-todo-tool-schema.patch",
+      "pr": null,
+      "why": "The v2 stand-in advertised only an untyped todos array and a five-word description, so Code Mode discovery did not teach agents the required content/status/priority shape or whole-list replacement. Subagent sessions therefore had no usable tool guidance. Advertise required item fields and status/priority enums, describe per-session replacement and single in-progress discipline, and give todoread a zero-argument schema. This improves discovery; a standing instruction is still needed to require usage.",
+      "markers": [
+        "Each call replaces the entire list",
+        "Read this session's current todo list; takes no arguments"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-24; touches only packages/omo-opencode/src/v2/project-config.ts and adds project-config.todo.test.ts. Runtime description literals survive bundling. Tests cover exact schemas, per-session persistence, whole-list replacement/clear, and preserving host-provided tools. Use the staging lane introduced in b7151fa79: fixes:apply stages beside the checkout and fixes:verify accepts that bundle path. Do not write live dist/index.js under active OpenChamber; activation is owner-initiated offline. pr is null because src/v2 is not in upstream dev.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10250"
+    },
+    {
+      "id": "26-startup-check-once-per-process",
+      "title": "Run the deferred startup check once per process, not per plugin instance",
+      "commit": "fe7faf0b77a04e9883193b96de2c5e622d7d38f1",
+      "patch": "patches/26-startup-check-once-per-process.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10118",
+      "why": "The already-checked flag lived in the per-instance closure of createAutoUpdateCheckerHook, so every folder rebuild re-ran the whole deferred startup check (config-error toast, connected-providers fetch, model-capabilities refresh + 3,823-model cache rewrite, npm update check; ~0.85s each) about 5s after any root session.created, fanning out across all live OMO instances (measured 79 capabilities-cache rewrites in 26h; app-layer addendum B.6). The gate now lives on globalThis behind the registered symbol omo.autoUpdateChecker.startupCheckState.v1 in a dependency-leaf module (startup-check-process-state.ts), so it survives per-location plugin module re-imports within one OpenCode process and resets only on process restart. A failed check logs and still closes the gate so failures do not fan out either.",
+      "markers": [
+        "startup check already completed in this process",
+        "startup check failed:",
+        "omo.autoUpdateChecker.startupCheckState.v1"
+      ],
+      "overlapsWith": [],
+      "orderNote": "First-message-drop F5a (fix plan v2 2026-10-12). The leaf module exists so test-setup.ts can reset the gate at preload time without importing the checker graph (HOME reads at import time poison the hermetic home). hook.test.ts resets via the same leaf. pr null for now: v2-lane only; upstreamable after the closed window."
+    },
+    {
+      "id": "27-model-capabilities-write-once",
+      "title": "Rewrite the model-capabilities cache only when its content changes",
+      "commit": "2422a87e8e4bf2b603db15008b4b82e73f0b57bf",
+      "patch": "patches/27-model-capabilities-write-once.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10119",
+      "why": "refreshModelCapabilitiesCache unconditionally rewrote the multi-megabyte model-capabilities.json on every startup-check run even when the models.dev catalog was unchanged (79 rewrites in 26h across instances; each rewrite is ~0.85s of fs work). createJsonFileCacheStore gains writeIfChanged: serialize, compare with the on-disk file, skip identical writes while still updating the in-memory value and writtenInCurrentProcess. The refresh path uses writeIfChanged; plain write() is unchanged for every other caller.",
+      "markers": [
+        "unchanged; skipped write",
+        "writeIfChanged"
+      ],
+      "overlapsWith": [],
+      "orderNote": "First-message-drop F5b. Independent of fix 26: it also protects the CLI refresh path and any future caller. writeIfChanged is a runtime method name and survives bundling."
+    },
+    {
+      "id": "28-config-handler-cross-folder-reuse",
+      "title": "Reuse config-handler artifacts across chat folders via a process-level cache",
+      "commit": "42289f2a94056ed70b8bf469af6745fbdd86a3bc",
+      "patch": "patches/28-config-handler-cross-folder-reuse.patch",
+      "pr": null,
+      "why": "OMO config handler owned 11.7s of a 17.7s cold plugin setup (66%, app-layer addendum B.5; warm 0.4s), and OpenCode rebuilds plugin instances on folder release (UI 30s release) and hourly eviction, so folders kept re-paying the cold cost even though plugin components, agents, global commands and the Claude Code MCP configs are identical for every chat folder. New shared/process-config-cache.ts stores entries on globalThis behind Symbol.for omo.processConfigCache.v1 (survives per-location module re-imports, per-process lifetime): plugin components keyed by the claude_code config slice + a fingerprint of the ~/.claude plugin roots (retryable failures never cached); the agent-config snapshot hoisted from the per-instance closure to a process map keyed by the OpenCode config slice + fingerprintProjectSources(directory) - folders with none of the project source roots (every OpenChamber chat folder is an empty dir) share the constant no-project-sources key, folders with project content stay per-directory; the directory-independent command sources memoized (builtin commands/skills, user + global commands/skills; project sources still load per folder); loadMcpConfigs memoized on a ~/.claude.json + ~/.claude/settings.json fingerprint (cwd-bound builtin MCPs still rebuild per folder). Known limitation: an in-place content edit inside an existing project source dir does not change the dir stat/listing fingerprint; invalidation paths remain config change, config.updated cycle, restart, or the kill-switch. Escape hatch: OMO_DISABLE_PROCESS_CONFIG_CACHE=1 restores per-call loads. test-setup.ts resets the cache per test.",
+      "markers": [
+        "reusing cached plugin components (process-level)",
+        "no-project-sources",
+        "reusing cached Claude Code MCP configs (process-level)",
+        "reusing cached global command sources (process-level)",
+        "omo.processConfigCache.v1"
+      ],
+      "overlapsWith": [
+        "24-agent-writer-self-ingest"
+      ],
+      "orderNote": "First-message-drop F5c. test-setup.ts is part of this commit because it imports resetProcessConfigCacheForTests (fix 26 startup-check reset coexists there via the leaf module). Cross-folder agent reuse is output-equivalent by test: two distinct empty folders produce deep-equal agent configs through the REAL applyAgentConfig (config-handler.process-cache.test.ts). The snapshot replay still deep-clones agents per instance because attachHiddenConfigKeyAliases and applyToolConfig mutate config.agent.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10251"
+    },
+    {
+      "id": "29-setup-phase-timing",
+      "title": "Per-phase timing for plugin setup and the config handler",
+      "commit": "c51041f3284ab6d7932ed31a68b39ffb96d2726b",
+      "patch": "patches/29-setup-phase-timing.patch",
+      "pr": null,
+      "why": "The cold plugin setup had no per-phase attribution - OMO share of a cold start was only measurable end to end (app-layer B.5 reconstructed it from http.span boundaries). The config handler now logs [config-handler] phase timing with per-phase milliseconds (provider, pluginComponents, hooks, agents, tools, agentAliases, mcp, commands, runtimeSkills, total) plus agentsCacheHit/componentsCacheHit flags and the directory; the plugin setup logs [oh-my-openagent] setup phase timing (startupMigrationAndValidation, pluginInit, managers, tools, hooks, interface, total) to oh-my-opencode.log. Also adds a cross-folder perf scenario to the plugin-init perf test measuring a second empty chat folder init against the process cache from fix 28.",
+      "markers": [
+        "[config-handler] phase timing",
+        "[oh-my-openagent] setup phase timing"
+      ],
+      "overlapsWith": [
+        "28-config-handler-cross-folder-reuse"
+      ],
+      "orderNote": "First-message-drop F16 (OMO lane). Must come after 28: the timing record reports the 28 cache-hit flags. The lazy-loading half of F16 is NOT implemented by design: the process cache already removes the repeat cost deterministically, and deferring the plugin-components load would change what the first config hook returns; the proposal lives in the fix report instead. getLastConfigHandlerPhaseTiming() and getPluginComponentsRealLoadCount() are observability seams so the hermetic suite needs no module mocks (mocking the ../shared barrel leaked across test files sharing a worker).",
+      "upstream": "N/A — local diagnostic/performance instrumentation for workstation cold-setup attribution; no standalone upstream product defect or universal timing policy asserted."
+    },
+    {
+      "id": "30-skill-v2-permission-bridge",
+      "title": "Give projected v1 tools a working ask() through the v2 permission system",
+      "commit": "5b9e890316150b476c1fd141cad44c705b411341",
+      "patch": "patches/30-skill-v2-permission-bridge.patch",
+      "pr": null,
+      "why": "Fix 23 stopped the ctx.ask crash but skipped the skill permission prompt entirely on v2: the plugin host narrows ctx.permission to hook/list/get/reply (verified in the 2.0.25 and dev host.ts; there is no public request-creation API for a plugin tool), and a projected tool's context carries no ask. The platform's external surface POST /api/session/{id}/permission (Permission.ask) evaluates session/agent rules, parks a REAL pending request that clients prompt on (permission.asked), and returns the outcome as a permission.replied event readable via ctx.event. The bridge implements the v1 ask() contract on top of that: allow resolves, deny throws SkillPermissionDeniedError, a user rejection throws, an aborted tool call rejects its own parked request best-effort, and with no reachable server origin (or a create failure before anything was shown) it degrades to the fix-23 logged skip - a documented fail-open, chosen so an origin flap cannot brick the tool that fix 23 repaired.",
+      "markers": [
+        "v2 permission bridge: no server origin; skill permission prompt skipped",
+        "v2 permission bridge: asking the user"
+      ],
+      "overlapsWith": [
+        "23-skill-v2-ctx-ask-guard"
+      ],
+      "orderNote": "After 23 (renumbered from 26 to avoid colliding with the lane agent's cold-start fixes 26-29): tools.ts is unchanged - fix 23's typeof-ask guard now finds the bridge-provided ask() on the projected context, so v1 hosts keep their native ask and v2 gets the prompt. Origin resolution adds a netstat fallback for Windows where the lsof-based listenPortOf cannot work, covering OpenChamber's embedded server. pr is null: src/v2 is not in upstream dev; the upstreamable slice (the fix-23 guard itself) is filed as a separate upstream PR.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10068",
+      "upstreamNote": "API-gap issue coverage; the local transport workaround is not a submitted or accepted permission API."
+    },
+    {
+      "id": "31-test-host-agent-id",
+      "title": "Align the v2 host agent-id expectation with fix 21",
+      "commit": "1c45f93d67afd7bb4487fcff60adae6ed6500d55",
+      "patch": "patches/31-test-host-agent-id.patch",
+      "pr": null,
+      "why": "Test-only. v2/host.test.ts still expected the nested oh-my-openagent/ agent id that fix 21 replaced with the bare id, and a QA evidence file was tracked by mistake. Recorded so a rebuilt branch keeps the suite honest.",
+      "markers": [],
+      "overlapsWith": [
+        "21-agent-registration-flat"
+      ],
+      "orderNote": "Test-only: markers are empty because nothing in it reaches dist/index.js (see fix 09).",
+      "upstream": "N/A — test bookkeeping for local fix 21, not an independent runtime defect; fix 21 is covered by https://github.com/code-yeongyu/oh-my-openagent/issues/10249."
+    },
+    {
+      "id": "32-test-prefailures-spawn-shim",
+      "title": "Fix pre-existing test failures; route the lsof probe through the spawn shim",
+      "commit": "2615ea8f0c319e8834289c70cb9dfef397ae66df",
+      "patch": "patches/32-test-prefailures-spawn-shim.patch",
+      "pr": null,
+      "why": "v2/serve-http.ts called Bun.spawn directly, which the adapter runtime audit forbids and which throws under Node; it now uses the shared spawn shim. The rest is test hygiene: prompt-route allowlist entries for the v2 adapter, a GC before removing a bun:sqlite database on Windows, and environment isolation for the truncator tests.",
+      "markers": [],
+      "overlapsWith": [
+        "30-skill-v2-permission-bridge"
+      ],
+      "orderNote": "The production change adds no runtime string, so markers are empty; packages/omo-opencode/src/shared/opencode-adapter-bun-runtime-audit.test.ts is its regression test. Must come before 33, which removes the last raw Bun.spawn.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10253",
+      "upstreamNote": "Issue covers the runtime Bun.spawn defect only; remaining test hygiene is not separately posted."
+    },
+    {
+      "id": "33-permission-bridge-verified-outcomes",
+      "title": "Never let a skill through on an unverified permission outcome",
+      "commit": "add2fa047fe107d2b311a17540bab393517ea57d",
+      "patch": "patches/33-permission-bridge-verified-outcomes.patch",
+      "pr": null,
+      "why": "Fix 30 resolved on every create failure. A cancelled tool call, or a create whose response was lost after the server had parked the request, therefore ran the skill without an answer and left the prompt dangling. It also subscribed to the reply after the create response, so a fast answer was lost and the call waited forever, and an aborted wait kept its event subscription. The bridge now chooses the request id, listens before it creates, rejects every aborted call, checks whether a failed create was parked (parked: wait; unverifiable: reject; verified unparked, retried once: the documented fail-open), rejects when a parked request disappears without an observed reply, bounds the create, always closes its subscription, runs netstat through the windows-hide spawn helper, and sends the server password only to a listener that refuses anonymous requests the way OpenCode does. OMO_V2_PERMISSION_FAIL_CLOSED=1 turns the remaining fail-open cases into rejections.",
+      "markers": [
+        "v2 permission bridge: permission check unavailable; skill blocked",
+        "skill permission request was answered but the reply was not observed; refusing to proceed"
+      ],
+      "overlapsWith": [
+        "30-skill-v2-permission-bridge",
+        "23-skill-v2-ctx-ask-guard"
+      ],
+      "orderNote": "After 30 and 32. The two fix-30 marker strings are kept verbatim. Cross-review A findings B1, M1, M2, M6.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10068",
+      "upstreamNote": "API-gap issue coverage for hardening local fix 30; not a claim upstream accepted the local fail-open policy."
+    },
+    {
+      "id": "34-process-cache-effective-keys",
+      "title": "Key the process config cache by every input it was built from",
+      "commit": "e2f966ba0f3edf4efbe02c0841c13cf7f2d9d4fd",
+      "patch": "patches/34-process-cache-effective-keys.patch",
+      "pr": null,
+      "why": "Fix 28's caches could replay artifacts built from other inputs: the agent snapshot ignored the OMO config (an instance with other disabled agents got the first instance's agents), the MCP cache watched two files that are not among the four the loader reads and ignored its cwd, the command cache ignored the user command and skill directories, the project fingerprint saw only top-level entries, the per-handler snapshot hid changes the fingerprint did see, and ancestor directories were not considered. Every key now covers its inputs with content fingerprints (path, mtime, size of every file, six levels deep); a source tree too large to fingerprint is not cached. Measured on the live profile: 16-22 ms per config pass, sibling chat folders still share one snapshot.",
+      "markers": [
+        "fingerprintAncestorSources",
+        "buildClaudeMcpCacheKey",
+        "known_marketplaces.json"
+      ],
+      "overlapsWith": [
+        "28-config-handler-cross-folder-reuse"
+      ],
+      "orderNote": "After 28 and 29. Removes the in-place-edit limitation documented for 28. Cross-review A findings M3, M4, M7.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10251"
+    },
+    {
+      "id": "35-model-capabilities-catalog-compare",
+      "title": "Do not rewrite the model capabilities cache for an unchanged catalog",
+      "commit": "14ac6d49967e778e0bdaa0c90b1a1f5a0b7f5ce2",
+      "patch": "patches/35-model-capabilities-catalog-compare.patch",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/10119",
+      "why": "Fix 27 compared the whole serialized snapshot, whose generatedAt is stamped on every fetch, so an unchanged catalog was still rewritten after every fetch. The store takes a comparable() that decides a rewrite; the capabilities cache excludes generatedAt.",
+      "markers": [
+        "unchanged; skipped write"
+      ],
+      "overlapsWith": [
+        "27-model-capabilities-write-once"
+      ],
+      "orderNote": "After 27. The change adds no new runtime string; the marker is fix 27's skip log line, which this fix keeps reachable for an unchanged catalog (regression test: shared/model-capabilities-cache.unchanged-catalog.test.ts). Cross-review A finding M5."
+    },
+    {
+      "id": "36-prompt-audit-reviewed-accesses",
+      "title": "Pin each prompt-route exemption to its reviewed raw accesses",
+      "commit": "def770eb57ac89891fa0bede58d25c438fe147b1",
+      "patch": "patches/36-prompt-audit-reviewed-accesses.patch",
+      "pr": null,
+      "why": "Test-only. A whole-file allowlist entry in the prompt-route audit exempted every future raw session.prompt call in that file; each allowlisted file must now match its reviewed count.",
+      "markers": [],
+      "overlapsWith": [
+        "32-test-prefailures-spawn-shim"
+      ],
+      "orderNote": "Test-only: markers are empty because nothing in it reaches dist/index.js. Cross-review A finding N1.",
+      "upstream": "N/A — local test/audit policy for carried raw prompt accesses; not an independent upstream feature."
+    },
+    {
+      "id": "37-compaction-recovery-control-plane",
+      "title": "Restore checkpointed config once through v2 control APIs without model-visible prompts",
+      "commit": "21382f49839c900982ea1c3e2affbb160e603dc1",
+      "originalCommit": "8260428be32a8e5b156d7cabbf49d6fc1ccaca7f",
+      "patch": "patches/37-compaction-recovery-control-plane.patch",
+      "pr": null,
+      "why": "X-149: v2 output events were not translated, so productive steps appeared as empty tails; recovery only had a cooldown and skipped config checks on that path. V2 sendPrompt also dropped noReply, exposing its configuration sentinel to the model and potentially to Claude's tool-result steering. Recovery now admits at most one accepted restore per captured checkpoint, validates persistent v2 agent/model on every trigger, invalidates failed compactions, translates actual output, and uses control APIs only for restoration. General noReply is synthetic with resume=false.",
+      "markers": [
+        "compaction-recovery-once accepted"
+      ],
+      "overlapsWith": [
+        "13-compaction-pin-checkpoint"
+      ],
+      "orderNote": "Rebased onto the activated 36-fix lane without dropping entries 30-36. Original side-branch slot 30 was renumbered to 37. Pair with the opencode-claude-v2 parked-history-boundary-changed fix (original 27fcc05): it stops reuse of the old parked Claude turn after another provider summarized. Tests: compaction-context-injector/loop-regression.test.ts and v2/session-actions.recovery.test.ts. Existing preemptive-compaction timeout/cache-clear and runtime-fallback protections remain carried. Stage only while OpenChamber runs; import source and activate during the closed window.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10252"
+    },
+    {
+      "id": "38-v2-native-parent-linkage",
+      "title": "Create v2 child sessions with the native parentID so subagents nest under their parent",
+      "commit": "e9519d4fe73118e456bba99fcea4f0d9f6580321",
+      "patch": "patches/38-v2-native-parent-linkage.patch",
+      "pr": null,
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10173",
+      "why": "The v2 facade's session.create kept body.parentID only in metadata.omoParentID and adapter memory and never passed it to the native create, so every task/call_omo_agent/background subagent session was stored with parent_id NULL and appeared top-level in OpenChamber (ses_ec39f036, ses_ec3a264d, ses_ec3aa4f4 on 2026-10-14). Native parentID is supported since OpenCode v2.0.22 (anomalyco/opencode#52359); the host then places the child at its parent's location and ignores location, so a child that asked for another directory is moved there with session.move.",
+      "markers": [
+        "directory: requestedDirectory })"
+      ],
+      "overlapsWith": [
+        "37-compaction-recovery-control-plane",
+        "19-compaction-aware-timeout-lane-guards",
+        "31-test-host-agent-id"
+      ],
+      "orderNote": "Touches createSession in src/v2/session-actions.ts (fix 37 edits sendPrompt in the same file) and the v2 host.test.ts owner test (fixes 19 and 31). Apply after 37. Tests: v2/host.test.ts. src/v2 comes from upstream PR #9016, not dev; the same change rebased on the #9016 head is https://github.com/mradwankhalil/oh-my-openagent/tree/fix/v2-native-parent-linkage-on-9016 for when #9016 lands.",
+      "upstreamPR": "https://github.com/SwarmStorm/oh-my-openagent/pull/2"
+    },
+    {
+      "id": "39-v2-agent-native-id",
+      "title": "List v2 agents by native id so task(subagent_type=\"general\") resolves",
+      "commit": "c4972b62907563aaa6fa469021730fd07be7db66",
+      "patch": "patches/39-v2-agent-native-id.patch",
+      "pr": null,
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10174",
+      "why": "The v2 facade's app.agents() reported each agent's display name as its V1 name, but V1 callers pass that name back as the prompt agent and OpenCode v2 resolves agents by id only. Built-ins keep a lowercase id and decorate a display name (general -> \"General\"), so task(subagent_type=\"general\") switched the child to \"General\" and failed with Agent not found: \"General\" (ses_ec3aa4f4, 2026-10-14). The user config agent.general = {color} stub is unrelated: the failure reproduces with no agent config at all.",
+      "markers": [
+        "name: typeof agent.id === \"string\" ? agent.id : agent.name"
+      ],
+      "overlapsWith": [
+        "38-v2-native-parent-linkage",
+        "19-compaction-aware-timeout-lane-guards",
+        "31-test-host-agent-id"
+      ],
+      "orderNote": "One line in src/v2/catalog.ts agentsFrom plus the v2 host.test.ts owner test. Apply after 38 (same test file). Tests: v2/host.test.ts. Rebased on the #9016 head at https://github.com/mradwankhalil/oh-my-openagent/tree/fix/v2-native-parent-linkage-on-9016.",
+      "upstreamPR": "https://github.com/SwarmStorm/oh-my-openagent/pull/2"
+    },
+    {
+      "id": "40-v2-hook-writeback-identity",
+      "title": "Write V2 context-hook message edits back by identity, not index",
+      "commit": "1f9b48ef2aedbe7ec36368d2a15b9a742c682aa0",
+      "patch": "patches/40-v2-hook-writeback-identity.patch",
+      "pr": "https://github.com/SwarmStorm/oh-my-openagent/pull/1",
+      "upstreamIssue": "https://github.com/anomalyco/opencode/issues/55271",
+      "why": "The V2 hook bridge wrote messages.transform output back by array index; an inserted message (team-mode status, monitor status, team mailbox, btw-side context) moved each later message's parts into its neighbour, putting reasoning + tool-call parts into a tool message. Every OpenCode 2.0.28 route rejected the request ('... tool messages only support tool-result content for now') and the turn failed to drain on every provider until the next user prompt changed which message the transform targets. Observed 3x in ses_ec3488f10ffenfb1BJ0CJEyU8x on 2026-10-14; all three reproduced from the stored history. The bridge now records each V1 view's source message and writes edits back to that message (inserted views become new messages).",
+      "markers": [
+        "viewSources.set(view, message)"
+      ],
+      "orderNote": "Independent of 01-39; touches only src/v2/message-shape.ts plus a new test. Cherry-picks cleanly onto integration/opencode-v2 (merge-tree). Tests: src/v2/message-shape.test.ts, hooks/team-mode-status-injector."
+    },
+    {
+      "id": "41-v2-tool-host-namespaces",
+      "title": "Preserve MCP namespaces and identify OpenCode compatibility-hook host",
+      "commit": "43cb85a7416514fbe789355c871c58f5f62b36ac",
+      "patch": "patches/41-v2-tool-host-namespaces.patch",
+      "pr": "https://github.com/SwarmStorm/oh-my-openagent/pull/3",
+      "why": "Legacy mcp_ repair consumed one underscore of mcp__server__tool, yielding unavailable _server__tool names. Claude-compatible context-mode hooks also emitted Claude tool identifiers inside OpenCode. Preserve double-underscore namespaces, stamp hook_host=opencode, and give the actual V2 catalog precedence over imported legacy fabric instructions.",
+      "markers": [
+        "/^mcp_(?!_)/i",
+        "hook_host: \"opencode\"",
+        "Imported instructions naming bare tools, mcp__server__tool aliases, or legacy get_tool_schema/invoke_tool endpoints do not create callable tools."
+      ],
+      "overlapsWith": [
+        "40-v2-hook-writeback-identity"
+      ],
+      "orderNote": "Apply after the v2 bridge and Claude-hook loader fixes. Paired context-mode hooks must honor hook_host: opencode (context-mode fix/opencode-hook-host-20261015). Scoped suite 36 pass; actual dispatcher-to-hook child probe PASS; fresh Claude child calls verified with prompt-delivered staged guidance. Live post-activation verification still required."
+    },
+    {
+      "id": "42-v2-shared-mcp-registry",
+      "title": "Keep shared namespaced MCP tools registered under V1 tool defaults",
+      "commit": "64f4a5e7f96bf3ff3991378ae6afac584446767b",
+      "patch": "patches/42-v2-shared-mcp-registry.patch",
+      "pr": null,
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10237",
+      "why": "V1 grep_app_*:false became shared V2 registry deletion, defeating librarian allows and colliding with user server names. Preserve all namespaced shared tools based on native options.namespace metadata, not a spelling exception. MCP execution still uses the host permission engine. Unnamespaced plugin/native disable behavior is unchanged. This does not fix MCP server override precedence or project V1 global deny defaults as host permission rules.",
+      "markers": [
+        "preserving shared namespaced MCP tool registration"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Owner superseded separate-restart plan: batch with fix41 + fix43, F21, paired context-mode hooks and OpenCode #55756 amendment, one combined offline script and one restart. Keep the original fix41 stage intact until final batch assembly. Regression RED 2 failures then GREEN 2 passes/10 assertions. Rename-back only after fix42+fix43 are active and live-verified with gateway route proof."
+    },
+    {
+      "id": "43-v2-host-mcp-precedence",
+      "title": "Host MCP entries win; OMO injects only missing servers",
+      "commit": "2466ef21fbd05df3fbf75fa27959c5e1550e8f48",
+      "patch": "patches/43-v2-host-mcp-precedence.patch",
+      "pr": null,
+      "why": "The empty V2 scratch config hid user entries from V1 merge precedence, and unconditional editor.set overwrote gateway routes. Native ConfigMcpPlugin runs before package plugins; inspect editor.get on every replay and leave existing entries intact, including disabled states, credentials and timeouts. Suppress the grep_app fallback when host grep-app migration alias exists, avoiding its duplicate direct connection. Do not normalize unrelated names or delete user entries; native execution permissions unchanged.",
+      "markers": [
+        "host MCP configuration wins; OMO fills gaps only"
+      ],
+      "overlapsWith": [
+        "42-v2-shared-mcp-registry"
+      ],
+      "orderNote": "Depends on native pre-plugin config ordering (core plugin/internal.ts + supervisor.ts). New regressions RED 0/5 then GREEN; expanded adapter suite 29 passes/104 assertions. Stage in final owner batch with fix41/fix42, F21, context-mode hooks and #55756 amendment. No upstream post/PR without owner go. Rename-back is post-restart final batch step, gated by live precedence + visibility verification and exactly-one original-name gateway-route proof.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10245"
+    },
+    {
+      "id": "44-v2-scoped-delegation-routing",
+      "title": "OMO agents use task-only delegation guidance; native agents retain subagent",
+      "commit": "8e6cc4f87e27de52c742fe76d118900ddec30075",
+      "patch": "patches/44-v2-scoped-delegation-routing.patch",
+      "pr": null,
+      "why": "V2 exposes native subagent directly and OMO task through Code Mode. Restrict task-only guidance to exact OMO identities/aliases, never generated-file ownership or every config agent. Register after legacy transforms even with no legacy hooks, remove stale guidance on native/custom switches, and retain native general/build/plan. Optional per-context hiding is opt-in only; production leaves it off and relies on the separately proven agent-local native permissions. No global registry removal.",
+      "markers": [
+        "OMO delegation routing: delegate ONLY through tools.task in the current Code Mode catalog."
+      ],
+      "overlapsWith": [
+        "41-v2-tool-host-namespaces"
+      ],
+      "orderNote": "Apply after fix41 (same bridge/test). Owner-approved Hephaestus pilot then17-ID config rollout and fresh OMO/native proof passed; native parent notifications preserved. Candidate RED8 failures then GREEN18, native-protection RED1 then GREEN19; review-gap coverage final20 passes. Full typecheck and isolated real OpenCode2.0.29/local-provider request proof PASS; live DB count unchanged. Full project attempt observed9 unrelated browser/sidecar failures then60s timeout; v2 discovery attempts timed out. Staged only in task-owned isolation; do not overwrite the existing shared stage, activate, restart, or post upstream without owner go. Localized OMO display overrides need explicit ownership injection; current active IDs have no such overrides. See corpus X-158 and task evidence report."
+    },
+    {
+      "id": "45-claude-quota-retry-status",
+      "title": "Accept Claude subscription quota wording in native retry statuses",
+      "commit": "389e2a21736be3bad0f4f013d1dac766900d6ac9",
+      "patch": "patches/45-claude-quota-retry-status.patch",
+      "pr": null,
+      "why": "Native session.retry.scheduled reached runtime-fallback but session/weekly limit wording was rejected before fallback-chain resolution. Reuse the existing quota classifier without broadening terminal/context error policy.",
+      "markers": [
+        "quota retry status accepted for fallback"
+      ],
+      "overlapsWith": [],
+      "orderNote": "44 remains reserved for the isolated scoped-delegation-routing candidate, which is NOT included here. Five regressions exercise V2 translation and mocked dispatch; live quota fallback end-to-end QA remains post-activation. Stage only under owner-approved existing teardown/timeout caveat."
+    },
+    {
+      "id": "46-v2-prompt-file-attachments",
+      "title": "Forward V1 prompt file parts to the V2 session as files",
+      "commit": "c0221c728c947c5b87385741553f9e7b8a7ac2fe",
+      "patch": "patches/46-v2-prompt-file-attachments.patch",
+      "pr": null,
+      "why": "The V2 host adapter (sendPrompt/textFromPrompt and the CLI run client) kept only text parts, so every look_at image/PDF attachment ({type:'file', url:file:///... or data:...;base64, filename}) was dropped before OpenCode V2. All 5 multimodal-looker children on 2026-10-17 02:10Z stored text-only user messages and answered 'No attachment is visible'; normal app sessions store files fine, so V2 core needed no change. Map file parts (and V2-shaped body.files) to files:[{uri,name}] on the V2 prompt and HTTP transport; text-only prompts send no files key; noReply (synthetic) prompts cannot carry attachments and now log that instead of dropping them silently.",
+      "markers": [
+        "filesFromPrompt",
+        "v2 noReply prompt cannot carry attachments; files not delivered"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Id 45 intentionally left free for the in-flight claude quota-retry fix (fix/claude-quota-retry-status-20261017); only the manifest merge is needed if 45 lands later. Independent of 01-44; touches src/v2/session-actions.ts and src/cli/run/v2-client.ts plus tests. Tests: src/v2/session-actions.files.test.ts, src/cli/run/v2-client.test.ts (RED 6 fail on pre-fix source, GREEN with host.test.ts + session-actions.recovery.test.ts 29 pass). Full typecheck PASS. Live smoke after owner-approved restart only: look_at on a known PNG -> child user session_message has files[0], assistant describes the image. Staged in task-owned isolation; do not overwrite the shared stage, activate, restart, or post upstream without owner go."
+    },
+    {
+      "id": "47-v2-setup-nonblocking",
+      "title": "Keep per-folder plugin setup off the shared event loop",
+      "commit": "2ffdf8fa63fb82affae889a0bf535e6dcacf3a74",
+      "patch": "patches/47-v2-setup-nonblocking.patch",
+      "pr": null,
+      "why": "Every new OpenChamber chat folder runs the whole plugin setup on the backend's single event loop; synchronous work there stalls every other session (owner symptom: a new chat freezes the app; Stage-2 plan P1). CPU profile of the setup in an isolated sandbox with the owner's real config: three detectWorktreePath copies ran execFileSync('git rev-parse') per folder even with no .git marker in any ancestor (chat folders never have one; timeout 5 s each), resolveSkillPathReferences' lookbehind regex cost ~45 ms per 2.4 MB pass per folder, team-mode probes spawned tmux+git per folder (now shared per process and PATH with a 3 s kill deadline, 5 min negative TTL, timeouts never remembered: review R5), MCP runtime PATH lookups were repeated per folder, and setup phases ran back to back without yielding. Fix: skip the git spawn without a marker (unless GIT_DIR), lookbehind-free scan with identical output (verified on 187 skill files), probe binaries and PATH lookups once per process, yield between setup phases. Isolated steady state: setup ~620 ms -> ~220 ms, loop blocked ~200 ms -> ~55 ms, longest slice ~200 ms -> ~55 ms, zero git spawns per chat folder.",
+      "markers": [
+        "probeBinaryShared",
+        "REFERENCE_BLOCKING_PREFIX",
+        "yieldSetupSlice",
+        "cachedBunWhich"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-46; touches packages/utils/src/skill-path-resolver.ts, the three project-discovery-dirs.ts copies (skills-loader-core, omo-opencode, claude-code-compat-core), features/team-mode/deps.ts, mcp/runtime-executable.ts, testing/create-plugin-module.ts, v2/host.ts plus tests. Tests: 5 new files + project-discovery-dirs.test.ts adjusted (its marker-less git fallback now needs GIT_DIR); RED 5 fail on pre-fix source, GREEN 343 pass across 43 files; full typecheck PASS; LSP clean. Acceptance after owner-approved restart only: backend 'runtime readiness phase completed phase=plugin.setup pluginID=oh-my-openagent' for a fresh chat folder, and %TEMP%/oh-my-opencode.log '[oh-my-openagent] setup phase timing' tools/total, against the 2026-10-17 baseline (tools p50 1500 ms, total p50 2298 ms). Residual: fix 28's source fingerprint walk (~55 ms synchronous per folder). Staged in task-owned isolation; do not overwrite the shared stage, activate, restart, or post upstream without owner go.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10436"
+    },
+    {
+      "id": "48-tui-mirror-reader-lease",
+      "title": "Refresh the TUI sidebar mirror on the heartbeat only while a TUI reads it",
+      "commit": "fda8ca8522eb8a548b3fd253ec50d3778708dc58",
+      "patch": "patches/48-tui-mirror-reader-lease.patch",
+      "pr": null,
+      "why": "features/tui-sidebar/mirror-manager.ts started a 2 s heartbeat per loaded folder that built a full snapshot (client session status, background tasks, agent resolution) and wrote the mirror atomically, whether or not any TUI was reading it. Measured on a real OpenCode 2.0.29 backend with 22 idle chat folders and no traffic: 11.9-12.3% of a core and 29-36 s of event-loop delay per 180 s, versus 2.7% / 3.4 s with OMO absent; timer attribution put 4.8 s per idle minute in this heartbeat (single callbacks up to 81 ms). The TUI (tui.ts readView) now touches a reader lease next to the mirror (throttled to one write per 2 s); the heartbeat stats the lease (path resolved once) and rebuilds/writes only while it is fresh (10 s). Event-driven flushes are unchanged.",
+      "markers": [
+        "readerLeaseFreshAt",
+        "READER_LEASE_MS",
+        "mirrorReaderLeasePath"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-47; touches features/tui-sidebar/{constants,mirror-path,mirror-io,mirror-manager}.ts and tui.ts plus mirror-manager.test.ts and mirror-io.test.ts. RED: the new tests fail on pre-fix source; GREEN: tui-sidebar 65 pass. Behaviour change: with no TUI attached the mirror is refreshed only by events (it was refreshed every 2 s); a TUI that attaches later shows the sidebar within one heartbeat (<= 2 s) of its first read. Markers are server-bundle symbols (dist/index.js); the TUI side (touchReaderLease in tui.ts) ships in dist/tui.js, which only a full `bun run build` / `bun run fixes:apply` regenerates.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10457"
+    },
+    {
+      "id": "49-v2-step-usage-forwarding",
+      "title": "Forward providerID and token usage from V2 step events to V1 message.updated",
+      "commit": "8c1b527dd072b6259922ef144fd8704d19b807df",
+      "patch": "patches/49-v2-step-usage-forwarding.patch",
+      "pr": "https://github.com/SwarmStorm/oh-my-openagent/pull/4",
+      "why": "The v2 bridge turned session.step.started/ended into message.updated with only {id, sessionID, role, finish}, so the preemptive-compaction token cache never filled on v2 and runPreemptiveCompactionIfNeeded returned at `if (!cached) return` on every step: 0 [preemptive-compaction] lines in %TEMP%/oh-my-opencode.log (70,471 lines since Oct 16 22:55Z) vs 15 real fires Oct 6-9 on v1. session.step.ended carries tokens {input,output,reasoning,cache{read,write}} + finish; session.step.started carries model {id,providerID,variant} + agent. A stateful createV1EventShaper() (one per subscription) remembers the model per assistant message and joins model + usage into the message.updated info; stateless toV1Event still forwards the tokens the ended event carries. Both subscription sites (v2/hook-bridge.ts, cli/run/v2-client.ts) use one shaper per stream.",
+      "markers": [
+        "createV1EventShaper",
+        "stepModelFrom",
+        "stepMessageUpdated"
+      ],
+      "overlapsWith": [],
+      "orderNote": "Independent of 01-48; touches v2/event-shape.ts, v2/hook-bridge.ts, cli/run/v2-client.ts plus tests. Tests: v2/event-shape.test.ts (started mapping, join, stateless tokens) + preemptive-compaction.test.ts integration (raw step events -> shaper -> hook -> session.summarize; RED against the pre-fix bridge shape: 'Received number of calls: 0'; GREEN 21 pass across the two files, plus 38 pass across v2-client/host/hook-bridge/loop-regression/limit-status). LSP clean; tsgo --noEmit -p packages/omo-opencode/tsconfig.json PASS. Upstream: issue #10465 + stacked PR SwarmStorm/oh-my-openagent#4 (base = #9016's branch, the only carrier of the v2 bridge). Post-restart acceptance: %TEMP%/oh-my-opencode.log shows [preemptive-compaction] lines again (summarize model resolved; fires above 78% usage), and v2 sessions compact preemptively.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10465"
+    },
+    {
+      "id": "50-v2-session-event-ownership",
+      "title": "Deliver V2 session events only to the folder that owns the session tree",
+      "commit": "a807c46758a180d0124c32dfb2888827548fa23a",
+      "patch": "patches/50-v2-session-event-ownership.patch",
+      "pr": "https://github.com/SwarmStorm/oh-my-openagent/pull/5",
+      "why": "OpenCode V2 hands every folder's plugin instance the whole process's event stream (plugin.ts runs plugins without Location.Service; plugin/host.ts event.subscribe is unscoped; bus.ts local() returns the unfiltered stream without an ambient Location). The bridge's subscription loop handed every event to the V1 hooks without an ownership check, so with 12 warm folders one probe session's session.error (ses_eb374b19dffe6xaXCskoSuTlqv, 2026-10-18T01:07Z, 503 auth_not_found) got 12 runtime-fallback retries: agent-switched x12, model-switched x1, 12 copies of the prompt, each instance applying its own folder's config (a second session got 13). createSessionOwnership() guards the loop: an instance owns a session when the session tree's root lives in ctx.location.directory (a child this instance created stays owned after a move); the folder comes from session.get (2 s timeout, cached), never from the envelope; non-session events pass; unresolvable sessions fail open, uncached.",
+      "markers": [
+        "createSessionOwnership",
+        "rawEventSessionID",
+        "v2 event skipped: session belongs to another folder"
+      ],
+      "overlapsWith": [
+        "49-v2-step-usage-forwarding"
+      ],
+      "orderNote": "After 49: both edit the subscription loop in v2/hook-bridge.ts (49 adds the shaper; 50 guards the loop before shaping). Also exports directoryOf/sameDirectory from v2/session-actions.ts; new v2/session-ownership.ts. Tests: v2/host.test.ts (two-folder single-retry, foreign filter, moved child root ownership, fail-open uncached, one lookup per session, non-session pass) — RED 5 fail / GREEN 23 pass. Upstream variant (self-contained helpers) on #9016 head: SwarmStorm/oh-my-openagent#5.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10473"
+    },
+    {
+      "id": "51-v2-model-context-limits",
+      "title": "Seed the context-limit cache from the V2 host model catalog",
+      "commit": "87c06893e8370934f4ba73e48081372b4d14a861",
+      "patch": "patches/51-v2-model-context-limits.patch",
+      "pr": "https://github.com/SwarmStorm/oh-my-openagent/pull/6",
+      "why": "After fix 49 the preemptive-compaction hook runs on v2 but never fires: 359/359 [preemptive-compaction] lines in %TEMP%/oh-my-opencode.log (2026-10-19) were 'Skipping preemptive compaction: unknown context limit for model' (opencode-go/deepseek-v4.1-flash at 79.1%, openai/gpt-6-astra, claude-code/claude-opus-5-5). resolveActualContextLimit (model-core context-limit-resolver.ts) reads modelContextLimitsCache for every non-Anthropic provider (claude-code included). Its only writer, applyProviderConfig, fills it from config.provider[*].models[*].limit.context during the config hook. On V1 that config is the user's opencode.json; on V2 setupOpenCodeV2 calls hooks.config({}) because the host owns provider config, so the cache was cleared and never filled. setupOpenCodeV2 now reads ctx.model.list() (bounded at 2 s; a failure is logged and ignored) and seeds scratch.provider with {models: {id: {limit: {context}}}}, keyed by catalog id and also by API modelID when different. After the hook it removes provider entries that are still pure seed (identity check), so projectProviders does not register host providers as plugin-declared ones.",
+      "markers": [
+        "seedModelContextLimits",
+        "v2 model context limits seeded",
+        "model context limits unavailable"
+      ],
+      "overlapsWith": [
+        "47-v2-setup-nonblocking"
+      ],
+      "orderNote": "After 47, which added the yieldToEventLoop stages around the config hook in v2/host.ts. 51 edits the same block: it seeds before hooks.config and unseeds after. Tests: v2/host.test.ts 'fix 51 model context limits (opencode-v2)'. RED against e624dd252: 2 fail, Expected 1000000 / Received null. GREEN: 26 pass. Adjacent suites (preemptive-compaction, context-limit-cache, model-core resolver, config-handler, event-shape, hook-bridge-tool-routing): 213 pass / 1 fail. The failure, 'Plan agent demote behavior > plan agent remains unchanged when planner is disabled', fails identically on the base. LSP clean; tsgo --noEmit -p packages/omo-opencode/tsconfig.json PASS. The upstream variant on #9016 head 502a4f0fd is SwarmStorm/oh-my-openagent#6 (RED 2 fail / GREEN 17 pass). Post-restart acceptance: %TEMP%/oh-my-opencode.log shows '[oh-my-openagent] v2 model context limits seeded' per folder, and '[preemptive-compaction]' lines stop reporting 'unknown context limit' for catalog models.",
+      "upstreamIssue": "https://github.com/code-yeongyu/oh-my-openagent/issues/10585"
+    }
+  ],
+  "externalFixes": [
+    {
+      "id": "squeez-wsl-timeout-supervisor",
+      "title": "squeez wrap must not leave a tool call pending on timeout",
+      "path": "C:\\Users\\Zephyrus\\.config\\opencode\\plugins\\squeez.js",
+      "why": "squeez prints its timeout notice but never returns control for wsl.exe commands (one call held a tool for 21,893s). The plugin now injects a supervisor for WSL commands only: bounded wait, taskkill /F /T /PID, exit 124.",
+      "markers": [
+        "WaitForExit",
+        "taskkill /F /T /PID"
+      ],
+      "verifyWith": "node C:\\Users\\Zephyrus\\.config\\opencode\\tests\\squeez-plugin.test.mjs",
+      "note": "Not part of the OMO repo; unaffected by an OMO update."
+    },
+    {
+      "id": "opencode-compaction-anchor-fix",
+      "title": "Anchor compaction summary to the marker message instead of lastUser",
+      "repo": "C:\\Users\\Zephyrus\\Documents\\ai\\opencode-core-fix",
+      "pipeline": "cd C:\\Users\\Zephyrus\\Documents\\ai\\opencode-core-fix && bun run fixes:apply && bun run fixes:verify",
+      "fixCommit": "b855924e87db342c69a3a4c26beefc77f4cdc858",
+      "base": "v1.18.32",
+      "why": "prompt.ts passed parentID: lastUser.id when creating the compaction summary. If a prompt landed between the compaction marker and the summary creation, the summary was orphaned (compaction loop) and the marker's model (a plugin-supplied pin) was discarded. Anchoring to the marker fixes both symptoms.",
+      "markers": [
+        "configured-compaction-agent",
+        "request-marker",
+        "marker already carries a completed summary"
+      ],
+      "verifyWith": "cd C:\\Users\\Zephyrus\\Documents\\ai\\opencode-core-fix && bun run fixes:verify",
+      "note": "Not part of the OMO repo. Has its own ledger at opencode-core-fix/local-fixes. Upgrades: bun run fixes:apply <version> rebuilds from the new tag, re-applies the immutable fix commit, gates on the test file + 3 binary markers, and stages to a stable filename. v1.x ONLY - the pipeline refuses v2+. OpenChamber is pinned to the staged binary by the User env var OPENCODE_BINARY (read at startup); opencodeBinary in ~/.config/openchamber/settings.json is cosmetic and gets dropped on settings rewrites."
+    }
+  ],
+  "retiredFixes": [
+    {
+      "id": "17-tool-args-in-place",
+      "title": "Tool argument rewrites land on the object opencode executes; git env prefix follows the configured shell",
+      "commit": "33582bc1967b5a8d4249e52b5772a95090ac5a3b",
+      "pr": "https://github.com/code-yeongyu/oh-my-openagent/pull/9449",
+      "retiredOn": "2026-10-13",
+      "retiredAt": "v5.1.33",
+      "upstream": "#9466 (argument rewrites in place, in 5.1.28) and #9909 (shell prefix follows the shell OpenCode runs, in 5.1.32); our PR #9449 was closed as landed",
+      "resolution": "non-interactive-env-hook.ts and its index.test.ts are upstream's files; replace-tool-args.ts was already identical"
+    },
+    {
+      "id": "22-hook-spawn-windowshide",
+      "title": "Hide shell-hook console windows when the backend has no console",
+      "commit": "4dcc1b377e4a8602aec00ddc47b03146f77971ee",
+      "pr": null,
+      "retiredOn": "2026-10-13",
+      "retiredAt": "v5.1.33",
+      "upstream": "#9837 (commit 6543d81c3, in 5.1.30) sets windowsHide: true on the same spawn",
+      "resolution": "execute-hook-command.ts is upstream's file; the textually clean merge left the windowsHide key twice in one object"
+    }
+  ]
+}

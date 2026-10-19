@@ -1,0 +1,375 @@
+From 168e72192e0dba791e3afc0eccda19bbc52f9633 Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 12 Sep 2026 03:52:08 +0300
+Subject: [PATCH] fix(background-agent): preserve lifecycle events during
+ cancellation
+
+(cherry picked from commit 61f8b0ec171a4c7a5c175c6ff228c559d59b9257)
+---
+ .../cancel-task-cleanup.test.ts               | 209 ++++++++++++++++++
+ .../src/features/background-agent/manager.ts  |  59 ++++-
+ 2 files changed, 266 insertions(+), 2 deletions(-)
+
+diff --git a/packages/omo-opencode/src/features/background-agent/cancel-task-cleanup.test.ts b/packages/omo-opencode/src/features/background-agent/cancel-task-cleanup.test.ts
+index 11e64d12a..ecf57ca63 100644
+--- a/packages/omo-opencode/src/features/background-agent/cancel-task-cleanup.test.ts
++++ b/packages/omo-opencode/src/features/background-agent/cancel-task-cleanup.test.ts
+@@ -135,6 +135,7 @@ describe("BackgroundManager.cancelTask cleanup", () => {
+     // then
+     expect(cancelled).toBe(false)
+     expect(task.status).toBe("running")
++    expect(task.cancellationRequested).toBeUndefined()
+     expect(getTaskMap(manager).get(task.id)).toBe(task)
+     expect(getPendingByParent(manager).get(task.parentSessionId)).toEqual(new Set([task.id]))
+   })
+@@ -220,4 +221,212 @@ describe("BackgroundManager.cancelTask cleanup", () => {
+     expect(concurrencyManager.getCount(concurrencyKey)).toBe(1)
+     expect(manager.getTask(pendingTask.id)?.status).toBe("running")
+   })
++
++  test("#given cancellation is waiting for session abort #when session.idle arrives #then idle does not complete or re-abort the task", async () => {
++    let resolveAbort: (() => void) | undefined
++    let abortStarted: (() => void) | undefined
++    const abortPending = new Promise<void>((resolve) => { resolveAbort = resolve })
++    const abortStartedPromise = new Promise<void>((resolve) => { abortStarted = resolve })
++    let abortCalls = 0
++    const manager = createBackgroundManager(undefined, async () => {
++      abortCalls += 1
++      abortStarted?.()
++      await abortPending
++      return { data: true }
++    })
++    const task = createMockTask({
++      id: "task-cancel-idle-race",
++      parentSessionId: "parent-session-cancel-idle-race",
++      sessionId: "session-cancel-idle-race",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++    Reflect.set(manager, "validateSessionHasOutput", async () => true)
++    Reflect.set(manager, "checkSessionTodos", async () => false)
++    let fallbackCalls = 0
++    Reflect.set(manager, "tryFallbackRetry", async () => {
++      fallbackCalls += 1
++      return true
++    })
++
++    const cancellation = manager.cancelTask(task.id, {
++      skipNotification: true,
++      source: "test",
++    })
++    await abortStartedPromise
++    manager.handleEvent({
++      type: "session.idle",
++      properties: { sessionID: task.sessionId },
++    })
++    manager.handleEvent({
++      type: "message.updated",
++      properties: {
++        info: {
++          sessionID: task.sessionId,
++          role: "assistant",
++          error: { name: "MessageAbortedError", message: "Aborted" },
++        },
++      },
++    })
++    await Promise.resolve()
++    await Promise.resolve()
++
++    expect(task.status).toBe("running")
++    expect(task.cancellationRequested).toBe(true)
++    expect(abortCalls).toBe(1)
++    expect(fallbackCalls).toBe(0)
++
++    resolveAbort?.()
++    expect(await cancellation).toBe(true)
++    expect(task.status).toBe("cancelled")
++    expect(abortCalls).toBe(1)
++  })
++
++  test("#given cancellation is already in flight #when cancelTask is called again #then only the first request aborts and finalizes", async () => {
++    let resolveAbort: (() => void) | undefined
++    let abortStarted: (() => void) | undefined
++    const abortPending = new Promise<void>((resolve) => { resolveAbort = resolve })
++    const abortStartedPromise = new Promise<void>((resolve) => { abortStarted = resolve })
++    let abortCalls = 0
++    const manager = createBackgroundManager(undefined, async () => {
++      abortCalls += 1
++      abortStarted?.()
++      await abortPending
++      return { data: true }
++    })
++    const task = createMockTask({
++      id: "task-concurrent-cancel",
++      parentSessionId: "parent-session-concurrent-cancel",
++      sessionId: "session-concurrent-cancel",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++    const firstCancellation = manager.cancelTask(task.id, { skipNotification: true, source: "first" })
++    await abortStartedPromise
++    const secondCancellation = manager.cancelTask(task.id, { skipNotification: true, source: "second" })
++
++    expect(await secondCancellation).toBe(false)
++    expect(abortCalls).toBe(1)
++
++    resolveAbort?.()
++    expect(await firstCancellation).toBe(true)
++    expect(task.status).toBe("cancelled")
++  })
++
++  test("#given cancellation abort fails while idle is suppressed #when abort failure completes #then the idle event is replayed", async () => {
++    let rejectAbort: (() => void) | undefined
++    let abortStarted: (() => void) | undefined
++    const abortPending = new Promise<void>((_, reject) => { rejectAbort = () => reject(new Error("abort failed")) })
++    const abortStartedPromise = new Promise<void>((resolve) => { abortStarted = resolve })
++    let abortCalls = 0
++    const manager = createBackgroundManager(undefined, async () => {
++      abortCalls += 1
++      if (abortCalls === 1) {
++        abortStarted?.()
++        await abortPending
++      }
++      return { data: true }
++    })
++    const task = createMockTask({
++      id: "task-replay-idle-after-abort-failure",
++      parentSessionId: "parent-session-replay-idle",
++      sessionId: "session-replay-idle",
++      startedAt: new Date(Date.now() - 10_000),
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++    Reflect.set(manager, "validateSessionHasOutput", async () => true)
++    Reflect.set(manager, "checkSessionTodos", async () => false)
++
++    const cancellation = manager.cancelTask(task.id, { skipNotification: true, source: "test" })
++    await abortStartedPromise
++    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
++    rejectAbort?.()
++
++    expect(await cancellation).toBe(false)
++    await Promise.resolve()
++    await Promise.resolve()
++    await Promise.resolve()
++    expect(task.status).toBe("completed")
++    expect(abortCalls).toBe(2)
++  })
++
++  test("#given cancellation abort fails while assistant error is suppressed #when abort failure completes #then the assistant error is replayed", async () => {
++    let rejectAbort: (() => void) | undefined
++    let abortStarted: (() => void) | undefined
++    const abortPending = new Promise<void>((_, reject) => { rejectAbort = () => reject(new Error("abort failed")) })
++    const abortStartedPromise = new Promise<void>((resolve) => { abortStarted = resolve })
++    let fallbackCalls = 0
++    const manager = createBackgroundManager(undefined, async () => {
++      abortStarted?.()
++      await abortPending
++      return { data: true }
++    })
++    const task = createMockTask({
++      id: "task-replay-assistant-error-after-abort-failure",
++      parentSessionId: "parent-session-replay-assistant-error",
++      sessionId: "session-replay-assistant-error",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++    Reflect.set(manager, "tryFallbackRetry", async () => {
++      fallbackCalls += 1
++      return true
++    })
++
++    const cancellation = manager.cancelTask(task.id, { skipNotification: true, source: "test" })
++    await abortStartedPromise
++    manager.handleEvent({
++      type: "message.updated",
++      properties: {
++        info: { sessionID: task.sessionId, role: "assistant", error: { name: "Retryable", message: "temporary" } },
++      },
++    })
++    rejectAbort?.()
++
++    expect(await cancellation).toBe(false)
++    await Promise.resolve()
++    await Promise.resolve()
++    expect(fallbackCalls).toBe(1)
++  })
++
++  test("#given cancellation abort fails while session error is suppressed #when abort failure completes #then the session error is replayed", async () => {
++    let rejectAbort: (() => void) | undefined
++    let abortStarted: (() => void) | undefined
++    const abortPending = new Promise<void>((_, reject) => { rejectAbort = () => reject(new Error("abort failed")) })
++    const abortStartedPromise = new Promise<void>((resolve) => { abortStarted = resolve })
++    const manager = createBackgroundManager(undefined, async () => {
++      abortStarted?.()
++      await abortPending
++      return { data: true }
++    })
++    const task = createMockTask({
++      id: "task-replay-session-error-after-abort-failure",
++      parentSessionId: "parent-session-replay-session-error",
++      sessionId: "session-replay-session-error",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++    Reflect.set(manager, "verifySessionExists", async () => false)
++
++    const cancellation = manager.cancelTask(task.id, { skipNotification: true, source: "test" })
++    await abortStartedPromise
++    manager.handleEvent({
++      type: "session.error",
++      properties: { sessionID: task.sessionId, error: { name: "MessageAbortedError", message: "Aborted" } },
++    })
++    rejectAbort?.()
++
++    expect(await cancellation).toBe(false)
++    await Promise.resolve()
++    await Promise.resolve()
++    expect(task.status).toBe("error")
++    expect(task.error).toBe("Aborted")
++  })
+ })
+diff --git a/packages/omo-opencode/src/features/background-agent/manager.ts b/packages/omo-opencode/src/features/background-agent/manager.ts
+index 5d2e3c69c..aad452295 100644
+--- a/packages/omo-opencode/src/features/background-agent/manager.ts
++++ b/packages/omo-opencode/src/features/background-agent/manager.ts
+@@ -271,6 +271,7 @@ export class BackgroundManager {
+   private completedTaskArchive: Map<string, BackgroundTask> = new Map()
+   private completedTaskSummaries: Map<string, BackgroundTaskNotificationTask[]> = new Map()
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
++  private cancellationEvents: Map<string, Event[]> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private readonly parentWakeNotifier: ParentWakeNotifier
+   private parentWakeTextDeltaBuffers: Map<string, string> = new Map()
+@@ -1574,6 +1575,24 @@ The fallback retry session is now created and can be inspected directly.
+     this.observedIncompleteTodosBySession.delete(sessionID)
+   }
+ 
++  private deferCancellationEvent(task: BackgroundTask, event: Event): void {
++    const events = this.cancellationEvents.get(task.id) ?? []
++    if (!events.some((pendingEvent) => pendingEvent.type === event.type)) {
++      events.push(event)
++      this.cancellationEvents.set(task.id, events)
++    }
++  }
++
++  private replayCancellationEvents(taskID: string): void {
++    const events = this.cancellationEvents.get(taskID)
++    this.cancellationEvents.delete(taskID)
++    for (const event of events ?? []) this.handleEvent(event)
++  }
++
++  private discardCancellationEvents(taskID: string): void {
++    this.cancellationEvents.delete(taskID)
++  }
++
+ 
+   private shouldHoldDispatchedParentWakeForTextDelta(
+     eventType: string,
+@@ -1672,6 +1691,10 @@ The fallback retry session is now created and can be inspected directly.
+ 
+       const { task } = resolved
+       if (task.status !== "running") return
++      if (task.cancellationRequested) {
++        this.deferCancellationEvent(task, event)
++        return
++      }
+ 
+       const assistantError = info.error
+       if (!assistantError) return
+@@ -1820,6 +1843,11 @@ The fallback retry session is now created and can be inspected directly.
+     if (event.type === "session.idle") {
+       if (!props || typeof props !== "object") return
+       const sessionID = resolveSessionEventID(props)
++      const resolved = sessionID ? this.resolveTaskAttemptBySession(sessionID) : undefined
++      if (resolved?.isCurrent && resolved.task.cancellationRequested) {
++        this.deferCancellationEvent(resolved.task, event)
++        return
++      }
+       if (sessionID) {
+         void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
+           log("[background-agent] Failed to flush pending parent wake:", { sessionID, error })
+@@ -1857,6 +1885,14 @@ The fallback retry session is now created and can be inspected directly.
+ 
+       const { task } = resolved
+       if (task.status !== "running") return
++      if (task.cancellationRequested) {
++        this.deferCancellationEvent(task, event)
++        log("[background-agent] Ignoring session.error during task cancellation:", {
++          taskId: task.id,
++          sessionID,
++        })
++        return
++      }
+ 
+       const errorObj = props?.error as { name?: string; message?: string } | undefined
+       const errorName = errorObj?.name
+@@ -2404,6 +2440,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     if (!task || (task.status !== "running" && task.status !== "pending")) {
+       return false
+     }
++    if (task.cancellationRequested) return false
+ 
+     const source = options?.source ?? "cancel"
+     const abortSession = options?.abortSession !== false
+@@ -2429,9 +2466,21 @@ The task was re-queued on a fallback model after a retryable failure.
+ 
+     const wasRunning = task.status === "running"
+     if (wasRunning && abortSession && task.sessionId) {
++      task.cancellationRequested = true
++      log("[background-agent] Task cancellation requested:", {
++        taskId: task.id,
++        sessionID: task.sessionId,
++        source,
++      })
+       const aborted = await this.abortSessionWithLogging(task.sessionId, `task cancellation (${source})`)
+-      if (!aborted) return false
++      if (!aborted) {
++        task.cancellationRequested = undefined
++        this.replayCancellationEvents(task.id)
++        return false
++      }
+ 
++      task.cancellationRequested = undefined
++      this.discardCancellationEvents(task.id)
+       clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+     }
+@@ -2550,7 +2599,7 @@ The task was re-queued on a fallback model after a retryable failure.
+    */
+   private async tryCompleteTask(task: BackgroundTask, source: string): Promise<boolean> {
+     // Guard: Check if task is still running (could have been completed by another path)
+-    if (task.status !== "running") {
++    if (task.status !== "running" || task.cancellationRequested) {
+       log("[background-agent] Task already completed, skipping:", { taskId: task.id, status: task.status, source })
+       return false
+     }
+@@ -2603,6 +2652,11 @@ The task was re-queued on a fallback model after a retryable failure.
+         clearDelegatedChildSessionBootstrap(task.sessionId)
+         SessionCategoryRegistry.remove(task.sessionId)
+ 
++        log("[background-agent] Task completion cleanup abort requested:", {
++          taskId: task.id,
++          sessionID: task.sessionId,
++          source,
++        })
+         // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+         await this.abortSessionWithLogging(task.sessionId, `task completion (${source})`)
+ 
+@@ -3215,6 +3269,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     this.idleDeferralTimers.clear()
+ 
+     this.parentWakeNotifier.shutdown()
++    this.cancellationEvents.clear()
+ 
+     for (const sessionID of trackedSessionIDs) {
+       subagentSessions.delete(sessionID)
+-- 
+2.55.0.windows.3
+

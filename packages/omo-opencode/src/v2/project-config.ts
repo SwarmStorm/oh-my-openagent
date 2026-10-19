@@ -5,7 +5,9 @@ import type { Plugin } from "@opencode/plugin"
 
 import { log } from "../shared/logger"
 import { agentMarkdownDirectory, nestedAgentID, writeAgentMarkdown } from "./agent-markdown"
+import { createPermissionBridge, type V1AskInput } from "./permission-bridge"
 import { toolInputSchema, toolResult } from "./tool-schema"
+import { collectOmoToolIDs, scopeAgentToolVisibility } from "./agent-tool-visibility"
 
 type V2Context = Plugin.Context
 
@@ -90,6 +92,11 @@ async function projectTools(input: {
   disabled: unknown
   defineTool: unknown
 }): Promise<void> {
+  // Implements the V1 ToolContext.ask() contract for every projected tool: the
+  // v2 host provides no ask (and ctx.permission cannot create a request), so
+  // the bridge parks a real permission request through the platform's
+  // /api/session/{id}/permission surface and awaits the user's reply.
+  const permissionBridge = createPermissionBridge(input.ctx)
   const tools = isRecord(input.tools) ? input.tools : {}
   const definitions = new Map<string, { description: string; input: Record<string, unknown>; execute: (args: unknown, context: unknown) => Promise<unknown> }>()
   for (const [name, value] of Object.entries(tools)) {
@@ -124,6 +131,7 @@ async function projectTools(input: {
               sessionID: context.sessionID,
               callID: context.id,
               abort: context.signal,
+              ask: (askInput: V1AskInput) => permissionBridge.ask(context, askInput),
             })
             return toolResult(result)
           },
@@ -137,15 +145,26 @@ async function projectTools(input: {
     }
 
     if (!isRecord(input.disabled)) return
+    // V1 tool defaults are not ownership of the shared V2 MCP registry.
+    // MCP execution already asks the host permission engine per session/agent;
+    // deleting its definition here defeats those permissions (including allows).
+    const sharedNamespacedToolIDs = new Set(editor.list()
+      .filter((registered) => typeof registered.options?.namespace === "string")
+      .map((registered) => registered.id))
     for (const [pattern, enabled] of Object.entries(input.disabled)) {
       if (enabled !== false) continue
       if (!pattern.includes("*")) {
-        editor.remove(pattern)
+        if (!sharedNamespacedToolIDs.has(pattern)) editor.remove(pattern)
         continue
       }
       const prefix = pattern.slice(0, pattern.indexOf("*"))
       for (const registered of editor.list()) {
-        if (registered.id.startsWith(prefix) || registered.name.startsWith(prefix)) editor.remove(registered.id)
+        if (!registered.id.startsWith(prefix) && !registered.name.startsWith(prefix)) continue
+        if (sharedNamespacedToolIDs.has(registered.id)) {
+          log("[oh-my-openagent] preserving shared namespaced MCP tool registration", { tool: registered.id })
+          continue
+        }
+        editor.remove(registered.id)
       }
     }
   })
@@ -161,9 +180,23 @@ function todoTool(
     description,
     input: {
       type: "object",
-      properties: {
-        todos: { type: "array" },
-      },
+      properties: name === "todowrite" ? {
+        todos: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+              priority: { type: "string", enum: ["high", "medium", "low"] },
+            },
+            required: ["content", "status", "priority"],
+            additionalProperties: false,
+          },
+        },
+      } : {},
+      ...(name === "todowrite" ? { required: ["todos"] } : {}),
+      additionalProperties: false,
     },
     execute: async (args: unknown, context: { sessionID: string }) => {
       if (name === "todowrite") todos.write(context.sessionID, args)
@@ -179,8 +212,8 @@ async function registerTodoTools(
   await ctx.tool.transform((editor) => {
     const names = new Set(editor.list().map((tool) => tool.name))
     for (const tool of [
-      todoTool("todowrite", "Update the session todo list", todos),
-      todoTool("todoread", "Read the session todo list", todos),
+      todoTool("todowrite", "Create or update this session's todo list for multi-step work, including delegated subagent work. Each call replaces the entire list: send every item every time, or an empty array to clear it. Keep one item in_progress at a time and mark finished items completed. Each item requires content (string), status (pending, in_progress, completed, cancelled), and priority (high, medium, low).", todos),
+      todoTool("todoread", "Read this session's current todo list; takes no arguments. Returns { todos: [...] } with content, status, and priority for each stored item.", todos),
     ]) {
       if (names.has(tool.name)) continue
       editor.add(tool)
@@ -224,6 +257,13 @@ export async function projectV1Surface(input: {
     if (!defaultAgent) return
     const nested = nestedAgentID(defaultAgent)
     if (editor.get(nameOr(editor, defaultAgent, nested))) editor.default(nameOr(editor, defaultAgent, nested))
+  })
+
+  // Scope delegation through agent permissions, before the host snapshots
+  // direct tools and Code Mode. Shared native utility replacements stay intact.
+  const omoToolIDs = collectOmoToolIDs(input.tools)
+  await input.ctx.agent.transform((editor) => {
+    scopeAgentToolVisibility(editor, omoToolIDs)
   })
 
   await projectTools({
@@ -280,6 +320,18 @@ export async function projectV1Surface(input: {
       const server = mcpServerFromV1(value)
       if (!server) continue
       try {
+        // Native ConfigMcpPlugin runs in the pre-plugin phase, before packages.
+        // Inspect its current entries on EVERY replay: preserve disabled states,
+        // credentials, timeout defaults and config reloads without copying them.
+        // The one explicit migration alias avoids a second direct grep server
+        // while the gateway still uses the temporary grep-app workaround key.
+        const existingName = editor.get(name)
+          ? name
+          : name === "grep_app" && editor.get("grep-app") ? "grep-app" : undefined
+        if (existingName) {
+          log("[oh-my-openagent] host MCP configuration wins; OMO fills gaps only", { server: name, existing: existingName })
+          continue
+        }
         editor.set(name, server)
       } catch (error) {
         log("[oh-my-openagent] mcp registration failed", {

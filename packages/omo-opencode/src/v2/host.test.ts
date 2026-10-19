@@ -6,6 +6,9 @@ import type { Plugin } from "@opencode/plugin"
 import { afterEach, describe, expect, test } from "bun:test"
 import { z } from "zod"
 
+import { applyProviderConfig } from "../plugin-handlers/provider-config-handler"
+import { createModelCacheState } from "../plugin-state"
+import { resolveActualContextLimit } from "../shared/context-limit-resolver"
 import { createAdapterState } from "./adapter-state"
 import { permissionsFromV1, renderAgentMarkdown } from "./agent-markdown"
 import { createV1PluginInput } from "./context-facade"
@@ -19,8 +22,11 @@ type RegisteredHook = {
   fn: (event: Record<string, unknown>) => Promise<void> | void
 }
 
-function createFakeContext(): {
+type FakeSessions = Record<string, { directory: string; parentID?: string }>
+
+function createFakeContext(opts: { directory?: string; sessions?: FakeSessions; getThrows?: boolean } = {}): {
   ctx: Plugin.Context
+  gets: string[]
   hooks: RegisteredHook[]
   tools: Array<{ name: string; execute: (input: unknown, context: { sessionID: string; id: string; signal: AbortSignal }) => Promise<{ content: string }> }>
   commands: Array<{ name: string; execute: (input: { sessionID: string; prompt: { text: string }; delivery: "steer" }) => Promise<void> }>
@@ -28,29 +34,39 @@ function createFakeContext(): {
   prompts: Array<{ sessionID: string; text: string }>
   agents: Map<string, { description?: string; mode?: string; system?: string }>
   pushEvent: (event: unknown) => void
-  calls: { agent: string[]; model: unknown[]; synthetic: string[]; create: unknown[] }
+  calls: { agent: string[]; model: unknown[]; synthetic: string[]; create: unknown[]; move: unknown[] }
 } {
   const hooks: RegisteredHook[] = []
   const tools: Array<{ name: string; execute: (input: unknown, context: { sessionID: string; id: string; signal: AbortSignal }) => Promise<{ content: string }> }> = []
   const commands: Array<{ name: string; execute: (input: { sessionID: string; prompt: { text: string }; delivery: "steer" }) => Promise<void> }> = []
   const mcps: Array<[string, { type: string; url?: string; disabled?: boolean }]> = []
   const prompts: Array<{ sessionID: string; text: string }> = []
-  const calls = { agent: [] as string[], model: [] as unknown[], synthetic: [] as string[], create: [] as unknown[] }
+  const calls = { agent: [] as string[], model: [] as unknown[], synthetic: [] as string[], create: [] as unknown[], move: [] as unknown[] }
+  const gets: string[] = []
+  const directory = opts.directory ?? "/tmp/project"
   const pendingEvents: unknown[] = []
   let notifyEvent: (() => void) | undefined
   const agents = new Map<string, { description?: string; mode?: string; system?: string }>([
-    ["oh-my-openagent/sisyphus", { description: "stale" }],
+    // Flat id: fix 21 registers agents under their bare names (agents/sisyphus.md).
+    ["sisyphus", { description: "stale" }],
   ])
 
   const ctx = {
     app: { name: "opencode", version: "2.0.16", channel: "stable" },
     location: {
-      directory: "/tmp/project",
-      project: { id: "proj", directory: "/tmp/project", canonical: "/tmp/project" },
+      directory,
+      project: { id: "proj", directory, canonical: directory },
     },
     options: {},
     session: {
-      get: async (input: { sessionID: string }) => ({ id: input.sessionID, title: "demo" }),
+      get: async (input: { sessionID: string }) => {
+        gets.push(input.sessionID)
+        if (opts.getThrows) throw new Error("host unavailable")
+        const known = opts.sessions?.[input.sessionID]
+        // Unknown sessions keep the old shape (no location), as before fix 50.
+        if (!known) return { id: input.sessionID, title: "demo" }
+        return { id: input.sessionID, title: "demo", location: { directory: known.directory }, ...(known.parentID ? { parentID: known.parentID } : {}) }
+      },
       context: async () => [{ type: "user", id: "msg", text: "hi" }],
       prompt: async (input: { sessionID: string; text: string }) => {
         prompts.push(input)
@@ -58,8 +74,9 @@ function createFakeContext(): {
       },
       create: async (input: unknown) => {
         calls.create.push(input)
-        const body = typeof input === "object" && input !== null ? input as { metadata?: { omoParentID?: string } } : {}
-        return { id: "created", metadata: body.metadata }
+        const body = typeof input === "object" && input !== null ? input as { parentID?: string; location?: unknown; metadata?: { omoParentID?: string } } : {}
+        // Like the native host, a child lands at its parent's location (the project here), not the requested one.
+        return { id: "created", metadata: body.metadata, location: body.parentID ? { directory: ctx.location.directory } : body.location }
       },
       interrupt: async () => undefined,
       switchAgent: async (input: { agent: string }) => {
@@ -69,7 +86,9 @@ function createFakeContext(): {
         calls.model.push(input.model)
       },
       update: async () => undefined,
-      move: async () => undefined,
+      move: async (input: unknown) => {
+        calls.move.push(input)
+      },
       wait: async () => undefined,
       generate: async () => ({ text: "" }),
       command: async () => undefined,
@@ -232,6 +251,7 @@ function createFakeContext(): {
   }
 
   return {
+    gets,
     ctx: ctx as unknown as Plugin.Context,
     hooks,
     tools,
@@ -355,7 +375,7 @@ describe("OpenCode V2 adapter", () => {
     expect(event.prompt.text).toBe("ulw build!")
 
     expect(readFileSync(join(directory, "sisyphus.md"), "utf8")).toContain("Do the work.")
-    expect(fake.agents.get("oh-my-openagent/sisyphus")?.description).toBe("Orchestrates work")
+    expect(fake.agents.get("sisyphus")?.description).toBe("Orchestrates work")
     expect(fake.tools.map((tool) => tool.name)).toEqual(["greeting", "todowrite", "todoread"])
     const result = await fake.tools[0]?.execute({ name: "Ada" }, { sessionID: "ses_1", id: "call_1", signal: new AbortController().signal })
     expect(result?.content).toBe("Hello Ada")
@@ -411,6 +431,59 @@ describe("OpenCode V2 adapter", () => {
     await cleanup?.()
   })
 
+  test("deduplicates V2 scheduled retries when a matching status event also arrives", async () => {
+    const fake = createFakeContext()
+    const seen: Array<{ type?: string; properties?: Record<string, unknown> }> = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, {
+      server: async () => ({
+        event: async (input: { event: { type?: string; properties?: Record<string, unknown> } }) => {
+          seen.push(input.event)
+        },
+      }),
+    })
+
+    const retry = {
+      sessionID: "ses_retry",
+      attempt: 2,
+      error: { type: "ProviderError", message: "overloaded", status: 503 },
+    }
+    fake.pushEvent({ type: "session.retry.scheduled", data: retry })
+    fake.pushEvent({
+      type: "session.status",
+      data: { sessionID: "ses_retry", status: { type: "retry", message: "overloaded", attempt: 2 } },
+    })
+    await waitFor(() => seen.length >= 1)
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(seen.filter((event) => event.type === "session.status")).toHaveLength(1)
+    await cleanup?.()
+  })
+
+  test("forwards a matching retry again after a non-retry event", async () => {
+    const fake = createFakeContext()
+    const seen: Array<{ type?: string }> = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, {
+      server: async () => ({
+        event: async (input: { event: { type?: string } }) => {
+          seen.push(input.event)
+        },
+      }),
+    })
+
+    const retry = {
+      sessionID: "ses_retry_again",
+      attempt: 2,
+      error: { type: "ProviderError", message: "overloaded", status: 503 },
+    }
+    fake.pushEvent({ type: "session.retry.scheduled", data: retry })
+    fake.pushEvent({ type: "session.execution.succeeded", data: { sessionID: "ses_retry_again" } })
+    fake.pushEvent({ type: "session.retry.scheduled", data: retry })
+    await waitFor(() => seen.filter((event) => event.type === "session.status").length >= 2)
+
+    expect(seen.filter((event) => event.type === "session.status")).toHaveLength(2)
+    await cleanup?.()
+  })
+
   test("agents, providers, and models use the V1 data shape", async () => {
     const fake = createFakeContext()
     const catalog = fake.ctx as unknown as {
@@ -418,14 +491,24 @@ describe("OpenCode V2 adapter", () => {
       provider: { list: () => Promise<unknown> }
       model: { list: () => Promise<unknown> }
     }
-    catalog.agent.list = async () => ({ data: [{ name: "oh-my-openagent/oracle", mode: "subagent", hidden: false }] })
+    // A native built-in keeps its id ("general") and only decorates the display name ("General");
+    // V1 callers pass the listed name back as `agent`, which the native host resolves by id.
+    catalog.agent.list = async () => ({
+      data: [
+        { name: "oh-my-openagent/oracle", mode: "subagent", hidden: false },
+        { id: "general", name: "General", mode: "subagent", hidden: false },
+      ],
+    })
     catalog.provider.list = async () => ({ data: [{ id: "openai", activation: "enabled" }] })
     catalog.model.list = async () => ({ data: [{ providerID: "openai", modelID: "gpt" }] })
     const v1 = createV1PluginInput(fake.ctx)
     const agents = await v1.client.app.agents()
     const providers = await v1.client.provider.list()
     const models = await v1.client.model.list()
-    expect(agents.data).toEqual([{ name: "oh-my-openagent/oracle", mode: "subagent", hidden: false }])
+    expect(agents.data).toEqual([
+      { name: "oh-my-openagent/oracle", mode: "subagent", hidden: false },
+      { name: "general", mode: "subagent", hidden: false },
+    ])
     expect(providers.data).toEqual({ connected: ["openai"], all: [{ id: "openai", models: { gpt: { id: "gpt" } } }] })
     expect(models.data).toEqual([{ provider: "openai", id: "gpt" }])
   })
@@ -469,7 +552,7 @@ describe("OpenCode V2 adapter", () => {
     await expect((unauthorized.client.session.status as () => Promise<unknown>)()).rejects.toThrow("unauthorized")
   })
 
-  test("create remembers parentID and prompt applies agent, model, and system", async () => {
+  test("create links the native parent and prompt applies agent, model, and system", async () => {
     const directory = mkdtempSync(join(tmpdir(), "omo-v2-parent-"))
     directories.push(directory)
     const fake = createFakeContext()
@@ -482,8 +565,10 @@ describe("OpenCode V2 adapter", () => {
     await (v1.client.session.create as (input: unknown) => Promise<unknown>)({
       body: { title: "child", parentID: "ses_parent", permission: [{ permission: "question", action: "deny", pattern: "*" }] },
     })
-    const created = fake.calls.create[0] as { metadata?: { omoParentID?: string }; permissions?: unknown[] }
+    const created = fake.calls.create[0] as { parentID?: string; metadata?: { omoParentID?: string }; permissions?: unknown[] }
+    expect(created.parentID).toBe("ses_parent")
     expect(created.metadata?.omoParentID).toBe("ses_parent")
+    expect(fake.calls.move).toEqual([])
     expect(created.permissions).toEqual([{ action: "question", resource: "*", effect: "deny" }])
     const children = await (v1.client.session.children as (input: unknown) => Promise<{ data: Array<{ id: string; parentID?: string }> }>)({ path: { id: "ses_parent" } })
     expect(children.data[0]?.parentID).toBe("ses_parent")
@@ -495,6 +580,32 @@ describe("OpenCode V2 adapter", () => {
     expect(fake.calls.model).toEqual([{ id: "gpt", providerID: "openai" }])
     expect(fake.calls.synthetic).toEqual(["be brief"])
     expect(fake.prompts[0]?.text).toBe("go")
+  })
+
+  test("a child requested in another directory is moved there after native parent linking", async () => {
+    // given
+    const directory = mkdtempSync(join(tmpdir(), "omo-v2-parent-"))
+    const worktree = mkdtempSync(join(tmpdir(), "omo-v2-member-"))
+    directories.push(directory, worktree)
+    const fake = createFakeContext()
+    Object.assign(fake.ctx.location, { directory })
+    const v1 = createV1PluginInput(fake.ctx, {
+      state: createAdapterState(`${directory}/.omo/v2-state`),
+      fetchImpl: async () => jsonResponse({ data: [], cursor: {} }),
+      argv: ["opencode", "serve", "--port", "9"],
+    })
+
+    // when
+    const result = await (v1.client.session.create as (input: unknown) => Promise<{ data?: { directory?: string; parentID?: string } }>)({
+      body: { title: "member", parentID: "ses_parent" },
+      query: { directory: worktree },
+    })
+
+    // then
+    expect((fake.calls.create[0] as { parentID?: string }).parentID).toBe("ses_parent")
+    expect(fake.calls.move).toEqual([{ sessionID: "created", directory: worktree }])
+    expect(result.data?.directory).toBe(worktree)
+    expect(result.data?.parentID).toBe("ses_parent")
   })
 
   test("stored tool, synthetic, and idle messages keep the V1 roles", async () => {
@@ -591,3 +702,210 @@ async function waitFor(ready: () => boolean): Promise<void> {
   }
   throw new Error("timed out waiting for adapter event")
 }
+
+// fix 50 (opencode-v2): the V2 host hands every folder's plugin instance the whole process's event
+// stream; V1 hooks assume it is scoped. One errored probe session got 12 runtime-fallback retries,
+// one from each warm folder (2026-10-18). Only the folder that owns the session tree may react.
+describe("fix 50 session ownership (opencode-v2)", () => {
+  type Seen = { type?: string; properties?: { sessionID?: string } }
+  const retryingServer = (seen: Seen[]) => async (input: unknown) => {
+    const v1 = input as { client: { session: { promptAsync: (request: unknown) => Promise<unknown> } } }
+    return {
+      event: async ({ event }: { event: Seen }) => {
+        seen.push(event)
+        if (event.properties?.sessionID !== "ses_probe" || event.type === "session.idle") return
+        // runtime-fallback's call shape: switch agent + model, then prompt the same session.
+        await v1.client.session.promptAsync({
+          path: { id: "ses_probe" },
+          body: { agent: "sisyphus", model: { providerID: "claude-code", modelID: "claude-opus-5-5" }, variant: "xhigh", parts: [{ type: "text", text: "retry" }] },
+        })
+      },
+    }
+  }
+  const failed = { type: "session.execution.failed", data: { sessionID: "ses_probe", error: { type: "provider.internal", status: 503, message: "auth_not_found" } } }
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  test("two folders, one failed session: exactly one retry, and only the owner switches the model", async () => {
+    const sessions: FakeSessions = { ses_probe: { directory: "/tmp/project" } }
+    const owner = createFakeContext({ directory: "/tmp/project", sessions })
+    const other = createFakeContext({ directory: "/tmp/other", sessions })
+    const ownerSeen: Seen[] = []
+    const otherSeen: Seen[] = []
+    const cleanups = [
+      await setupOpenCodeV2(owner.ctx, { server: retryingServer(ownerSeen) }),
+      await setupOpenCodeV2(other.ctx, { server: retryingServer(otherSeen) }),
+    ]
+    // The V2 bus every instance shares: the same raw event reaches both folders.
+    for (const fake of [owner, other]) fake.pushEvent(failed)
+    await waitFor(() => owner.prompts.length > 0)
+    await pause(40)
+    expect(owner.prompts.length + other.prompts.length).toBe(1)
+    expect(other.calls.model).toHaveLength(0)
+    expect(other.calls.agent).toHaveLength(0)
+    expect(otherSeen.some((event) => event.properties?.sessionID === "ses_probe")).toBe(false)
+    for (const cleanup of cleanups) await cleanup?.()
+  })
+
+  test("events of a session owned by another folder never reach the V1 handler", async () => {
+    const fake = createFakeContext({ sessions: { ses_foreign: { directory: "/tmp/other" }, ses_local: { directory: "/tmp/project" } } })
+    const seen: Seen[] = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { seen.push(event) } }) })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_foreign" } })
+    fake.pushEvent({ ...failed, data: { ...failed.data, sessionID: "ses_foreign" } })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_local" } })
+    await waitFor(() => seen.some((event) => event.properties?.sessionID === "ses_local"))
+    expect(seen.some((event) => event.properties?.sessionID === "ses_foreign")).toBe(false)
+    await cleanup?.()
+  })
+
+  test("a child moved to another folder belongs to the folder that owns its root", async () => {
+    const sessions: FakeSessions = { ses_root: { directory: "/tmp/project" }, ses_child: { directory: "/tmp/elsewhere", parentID: "ses_root" } }
+    const root = createFakeContext({ directory: "/tmp/project", sessions })
+    const elsewhere = createFakeContext({ directory: "/tmp/elsewhere", sessions })
+    const rootSeen: Seen[] = []
+    const elsewhereSeen: Seen[] = []
+    const cleanups = [
+      await setupOpenCodeV2(root.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { rootSeen.push(event) } }) }),
+      await setupOpenCodeV2(elsewhere.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { elsewhereSeen.push(event) } }) }),
+    ]
+    for (const fake of [root, elsewhere]) fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_child" } })
+    await waitFor(() => rootSeen.some((event) => event.properties?.sessionID === "ses_child"))
+    await pause(40)
+    expect(elsewhereSeen.some((event) => event.properties?.sessionID === "ses_child")).toBe(false)
+    for (const cleanup of cleanups) await cleanup?.()
+  })
+
+  test("an unresolvable session fails open (delivered) and is not cached", async () => {
+    const fake = createFakeContext({ getThrows: true })
+    const seen: Seen[] = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { seen.push(event) } }) })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_unknown" } })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_unknown" } })
+    await waitFor(() => seen.filter((event) => event.properties?.sessionID === "ses_unknown").length === 2)
+    expect(fake.gets.filter((id) => id === "ses_unknown").length).toBe(2)
+    await cleanup?.()
+  })
+
+  test("ownership is resolved once per session", async () => {
+    const fake = createFakeContext({ sessions: { ses_foreign: { directory: "/tmp/other" }, ses_local: { directory: "/tmp/project" } } })
+    const seen: Seen[] = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { seen.push(event) } }) })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_foreign" } })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_foreign" } })
+    fake.pushEvent({ type: "session.idle", data: { sessionID: "ses_local" } })
+    await waitFor(() => seen.some((event) => event.properties?.sessionID === "ses_local"))
+    expect(fake.gets.filter((id) => id === "ses_foreign").length).toBe(1)
+    await cleanup?.()
+  })
+
+  test("events without a session still reach the V1 handler", async () => {
+    const fake = createFakeContext({ sessions: { ses_foreign: { directory: "/tmp/other" } } })
+    const seen: Seen[] = []
+    const cleanup = await setupOpenCodeV2(fake.ctx, { server: async () => ({ event: async ({ event }: { event: Seen }) => { seen.push(event) } }) })
+    fake.pushEvent({ type: "config.updated", data: {} })
+    await waitFor(() => seen.some((event) => event.type === "config.updated"))
+    expect(seen.some((event) => event.type === "config.updated")).toBe(true)
+    await cleanup?.()
+  })
+})
+
+describe("fix 51 model context limits (opencode-v2)", () => {
+  const directories: string[] = []
+
+  afterEach(() => {
+    for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true })
+  })
+
+  function setup(opts: {
+    models: () => Promise<unknown>
+    config?: (config: Record<string, unknown>) => void
+  }): { fake: ReturnType<typeof createFakeContext>; modelCacheState: ReturnType<typeof createModelCacheState>; added: string[]; run: () => Promise<unknown> } {
+    const fake = createFakeContext()
+    const directory = mkdtempSync(join(tmpdir(), "omo-v2-limits-"))
+    directories.push(directory)
+    const modelCacheState = createModelCacheState()
+    const added: string[] = []
+    const host = fake.ctx as unknown as {
+      model: { list: () => Promise<unknown> }
+      provider: { transform: (fn: (editor: Record<string, unknown>) => void) => Promise<void> }
+    }
+    host.model.list = opts.models
+    host.provider.transform = async (fn) => {
+      fn({
+        list: () => [],
+        get: () => undefined,
+        add(provider: { info: { id: unknown } }) {
+          added.push(String(provider.info.id))
+        },
+        update() {},
+        remove() {},
+        models: { set() {}, update() {}, remove() {} },
+      })
+    }
+    const run = () => setupOpenCodeV2(fake.ctx, {
+      agentDirectory: directory,
+      server: async () => ({
+        // Mirrors the V1 config handler's provider phase.
+        config: async (config: Record<string, unknown>) => {
+          opts.config?.(config)
+          applyProviderConfig({ config, modelCacheState })
+        },
+      }),
+    })
+    return { fake, modelCacheState, added, run }
+  }
+
+  test("seeds the context-limit cache from the host model catalog", async () => {
+    const { modelCacheState, added, run } = setup({
+      models: async () => [
+        { id: "deepseek-v4.1-flash", modelID: "deepseek-v4.1-flash", providerID: "opencode-go", limit: { context: 1_000_000, output: 384_000 } },
+        { id: "gpt-6-astra", modelID: "gpt-6-astra", providerID: "openai", limit: { context: 1_050_000, output: 128_000 } },
+        { id: "claude-opus-5-5", modelID: "claude-opus-5-5", providerID: "claude-code", limit: { context: 1_000_000, output: 64_000 } },
+        { id: "alias", modelID: "api-name", providerID: "openai", limit: { context: 400_000, output: 32_000 } },
+      ],
+    })
+
+    await run()
+
+    expect(resolveActualContextLimit("opencode-go", "deepseek-v4.1-flash", modelCacheState)).toBe(1_000_000)
+    expect(resolveActualContextLimit("openai", "gpt-6-astra", modelCacheState)).toBe(1_050_000)
+    expect(resolveActualContextLimit("claude-code", "claude-opus-5-5", modelCacheState)).toBe(1_000_000)
+    expect(resolveActualContextLimit("openai", "alias", modelCacheState)).toBe(400_000)
+    expect(resolveActualContextLimit("openai", "api-name", modelCacheState)).toBe(400_000)
+    // The seed is host data: it must not be projected back as plugin-declared providers.
+    expect(added).toEqual([])
+  })
+
+  test("keeps providers the plugin itself declares", async () => {
+    const { modelCacheState, added, run } = setup({
+      models: async () => ({ data: [{ id: "m", providerID: "p", limit: { context: 300_000, output: 1 } }] }),
+      config: (config) => {
+        const providers = config.provider as Record<string, unknown>
+        providers.own = { name: "Own", models: { x: { limit: { context: 128_000 } } } }
+      },
+    })
+
+    await run()
+
+    expect(resolveActualContextLimit("p", "m", modelCacheState)).toBe(300_000)
+    expect(resolveActualContextLimit("own", "x", modelCacheState)).toBe(128_000)
+    expect(added).toEqual(["own"])
+  })
+
+  test("setup still completes when the model catalog is unavailable", async () => {
+    let configured = false
+    const { modelCacheState, run } = setup({
+      models: async () => {
+        throw new Error("catalog down")
+      },
+      config: () => {
+        configured = true
+      },
+    })
+
+    await run()
+
+    expect(configured).toBe(true)
+    expect(resolveActualContextLimit("opencode-go", "deepseek-v4.1-flash", modelCacheState)).toBeNull()
+  })
+})

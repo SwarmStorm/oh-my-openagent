@@ -1,5 +1,6 @@
 import { getSessionAgent } from "../../features/claude-code-session-state"
 import type { CompactionAgentConfigCheckpoint } from "../../shared/compaction-agent-config-checkpoint"
+import { isActiveCompactionPin } from "../../shared/compaction-pin-state"
 import { log } from "../../shared/logger"
 import { normalizeSDKResponse } from "../../shared/normalize-sdk-response"
 import { normalizePromptTools } from "../../shared/prompt-tools"
@@ -14,26 +15,56 @@ type SessionMessage = {
     model?: {
       providerID?: string
       modelID?: string
+      variant?: string
     }
     providerID?: string
     modelID?: string
+    variant?: string
     tools?: Record<string, boolean | "allow" | "deny" | "ask">
   }
+  // fix: compaction-part-marker — marker rows carry a compaction part
+  parts?: Array<{ type?: string }>
 }
 
 type ResolverContext = {
   client: {
     session: {
+      get?: (input: { path: { id: string } }) => Promise<unknown>
       messages: (input: { path: { id: string } }) => Promise<unknown>
     }
   }
   directory: string
 }
 
+async function persistentPromptConfig(ctx: ResolverContext, sessionID: string): Promise<CompactionAgentConfigCheckpoint | undefined> {
+  if (!ctx.client.session.get) return undefined
+  try {
+    const response = await ctx.client.session.get({ path: { id: sessionID } })
+    const info = normalizeSDKResponse(response, {} as {
+      agent?: string
+      model?: { id?: string; providerID?: string; variant?: string }
+      tools?: Record<string, boolean>
+    }, { preferResponseOnMissingData: true })
+    // V2 keeps agent/model on the session, not on each user/checkpoint row.
+    // V1 session.get has neither: keep its existing transcript-based fallback.
+    if (typeof info.agent !== "string" || isCompactionAgent(info.agent) ||
+        typeof info.model?.id !== "string" || typeof info.model.providerID !== "string") return undefined
+    const model = { providerID: info.model.providerID, modelID: info.model.id,
+      ...(typeof info.model.variant === "string" ? { variant: info.model.variant } : {}) }
+    if (isActiveCompactionPin(sessionID, model)) return undefined
+    const tools = normalizePromptTools(info.tools)
+    return { agent: info.agent, model, ...(tools ? { tools } : {}) }
+  } catch {
+    return undefined
+  }
+}
+
 export async function resolveSessionPromptConfig(
   ctx: ResolverContext,
   sessionID: string,
 ): Promise<CompactionAgentConfigCheckpoint> {
+  const persistent = await persistentPromptConfig(ctx, sessionID)
+  if (persistent) return persistent
   const storedModel = getSessionModel(sessionID)
   const promptConfig: CompactionAgentConfigCheckpoint = {
     agent: getSessionAgent(sessionID),
@@ -48,14 +79,35 @@ export async function resolveSessionPromptConfig(
 
     for (let index = messages.length - 1; index >= 0; index--) {
       const info = messages[index].info
+      // fix: compaction-part-marker — a row carrying a compaction part is a
+      // marker (bookkeeping), never working-model evidence, even when tagged
+      // with the working agent (observed 2026-09-27T23:37Z).
+      const rowParts = messages[index]?.parts
+      const markerRow =
+        Array.isArray(rowParts) &&
+        rowParts.some((part) => part?.type === "compaction")
 
       if (!promptConfig.agent && info?.agent && !isCompactionAgent(info.agent)) {
         promptConfig.agent = info.agent
       }
 
-      if (!promptConfig.model) {
+      if (!promptConfig.model && markerRow) {
+        log("[compaction-context-injector] skipped compaction-part marker row in working-model scan (compaction-part-marker)", {
+          sessionID,
+          skippedAgent: info?.agent,
+        })
+      }
+      if (!promptConfig.model && !markerRow) {
         const model = resolveValidatedModel(info)
-        if (model) {
+        // fix: compaction-pin-checkpoint — a marker/summary row carrying the
+        // active compaction pin (often tagged with the working agent, not
+        // "compaction") is the summarizer's model, never the working model.
+        if (model && isActiveCompactionPin(sessionID, model)) {
+          log("[compaction-context-injector] skipped compaction pin model in checkpoint capture (compaction-pin-checkpoint)", {
+            sessionID,
+            skipped: `${model.providerID}/${model.modelID}`,
+          })
+        } else if (model) {
           promptConfig.model = model
         }
       }
@@ -79,7 +131,7 @@ export async function resolveSessionPromptConfig(
     })
   }
 
-  if (!promptConfig.model && storedModel) {
+  if (!promptConfig.model && storedModel && !isActiveCompactionPin(sessionID, storedModel)) {
     promptConfig.model = storedModel
   }
 
@@ -90,18 +142,25 @@ export async function resolveLatestSessionPromptConfig(
   ctx: ResolverContext,
   sessionID: string,
 ): Promise<CompactionAgentConfigCheckpoint> {
+  const persistent = await persistentPromptConfig(ctx, sessionID)
+  if (persistent) return persistent
   try {
     const response = await ctx.client.session.messages({ path: { id: sessionID } })
     const messages = normalizeSDKResponse(response, [] as SessionMessage[], {
       preferResponseOnMissingData: true,
     })
-    const latestInfo = messages.at(-1)?.info
+    const latestMessage = messages.at(-1)
+    const latestInfo = latestMessage?.info
+    // fix: compaction-part-marker
+    const latestMarkerRow =
+      Array.isArray(latestMessage?.parts) &&
+      latestMessage.parts.some((part) => part?.type === "compaction")
 
     if (!latestInfo) {
       return {}
     }
 
-    const model = resolveValidatedModel(latestInfo)
+    const model = latestMarkerRow ? undefined : resolveValidatedModel(latestInfo)
     const tools = normalizePromptTools(latestInfo.tools)
 
     return {

@@ -1,0 +1,199 @@
+From 467366fca194096bf53884886b3bb64b922d3337 Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 29 Aug 2026 19:14:10 +0300
+Subject: [PATCH] fix_omo_pause_continuation_after_provider_failures
+
+(cherry picked from commit e3bbe1fd6076c9a5eed14c2e201c7573f921ced8)
+---
+ .../idle-event.test.ts                        | 109 ++++++++++++++++++
+ .../todo-continuation-enforcer/idle-event.ts  |  31 +++--
+ 2 files changed, 131 insertions(+), 9 deletions(-)
+
+diff --git a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+index 5563f45d3..af6530b72 100644
+--- a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
++++ b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+@@ -2,6 +2,7 @@
+ 
+ import { describe, expect, it } from "bun:test"
+ 
++import { FAILURE_RESET_WINDOW_MS, MAX_CONSECUTIVE_FAILURES } from "./constants"
+ import { handleSessionIdle } from "./idle-event"
+ import type { SessionStateStore } from "./session-state"
+ import type { ContinuationProgressUpdate, SessionState } from "./types"
+@@ -71,6 +72,9 @@ describe("handleSessionIdle", () => {
+           todo: async () => ({ data: [] }),
+         },
+       },
++      tui: {
++        showToast: async () => ({}),
++      },
+       directory: "/tmp/test",
+     }
+ 
+@@ -148,6 +152,111 @@ describe("handleSessionIdle", () => {
+     expect(resetCalls).toHaveLength(1)
+   })
+ 
++  it("stops continuation after repeated post-dispatch provider failures", async () => {
++    // given
++    const sessionID = "ses_provider_failure_limit"
++    const { store, trackCalls, state } = createStateStore()
++    state.consecutiveProviderFailures = MAX_CONSECUTIVE_FAILURES
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          todo: async () => ({
++            data: [{ id: "todo-1", content: "Ship", status: "pending", priority: "high" }],
++          }),
++        },
++        tui: {
++          showToast: async () => ({}),
++        },
++      },
++      directory: "/tmp/test",
++    }
++
++    // when
++    await handleSessionIdle({
++      ctx: ctx as never,
++      sessionID,
++      sessionStateStore: store,
++    })
++
++    // then
++    expect(trackCalls).toEqual([])
++  })
++
++  it("resets the provider failure boundary after the recovery window", async () => {
++    // given
++    const sessionID = "ses_provider_failure_recovery"
++    const { store, trackCalls, state } = createStateStore()
++    state.consecutiveProviderFailures = MAX_CONSECUTIVE_FAILURES
++    state.lastInjectedAt = Date.now() - FAILURE_RESET_WINDOW_MS
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          todo: async () => ({
++            data: [{ id: "todo-1", content: "Ship", status: "pending", priority: "high" }],
++          }),
++        },
++        tui: {
++          showToast: async () => ({}),
++        },
++      },
++      directory: "/tmp/test",
++    }
++
++    try {
++      // when
++      await handleSessionIdle({
++        ctx: ctx as never,
++        sessionID,
++        sessionStateStore: store,
++      })
++
++      // then
++      expect(state.consecutiveProviderFailures).toBe(0)
++      expect(trackCalls).toEqual([sessionID])
++    } finally {
++      store.cancelCountdown(sessionID)
++    }
++  })
++
++  it("preserves the pre-dispatch failure recovery boundary", async () => {
++    // given
++    const sessionID = "ses_pre_dispatch_failure_recovery"
++    const { store, trackCalls, state } = createStateStore()
++    state.consecutiveFailures = MAX_CONSECUTIVE_FAILURES
++    state.lastInjectedAt = Date.now() - FAILURE_RESET_WINDOW_MS
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          todo: async () => ({
++            data: [{ id: "todo-1", content: "Ship", status: "pending", priority: "high" }],
++          }),
++        },
++        tui: {
++          showToast: async () => ({}),
++        },
++      },
++      directory: "/tmp/test",
++    }
++
++    try {
++      // when
++      await handleSessionIdle({
++        ctx: ctx as never,
++        sessionID,
++        sessionStateStore: store,
++      })
++
++      // then
++      expect(state.consecutiveFailures).toBe(0)
++      expect(trackCalls).toEqual([sessionID])
++    } finally {
++      store.cancelCountdown(sessionID)
++    }
++  })
++
+   it("skips todo continuation when the previous internal continuation has only an empty unknown assistant turn", async () => {
+     // given
+     const sessionID = "ses_internal_noop_tail"
+diff --git a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.ts b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.ts
+index a5fac5c9f..fcd3b85d0 100644
+--- a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -143,24 +143,37 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
+-  if (
+-    state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES
+-    && state.lastInjectedAt
+-    && Date.now() - state.lastInjectedAt >= FAILURE_RESET_WINDOW_MS
+-  ) {
++  let consecutiveProviderFailures = state.consecutiveProviderFailures ?? 0
++  const failureResetWindowElapsed =
++    state.lastInjectedAt !== undefined && Date.now() - state.lastInjectedAt >= FAILURE_RESET_WINDOW_MS
++  if (failureResetWindowElapsed && state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+     state.consecutiveFailures = 0
+     log(`[${HOOK_NAME}] Reset consecutive failures after recovery window`, { sessionID, failureResetWindowMs: FAILURE_RESET_WINDOW_MS })
+   }
++  if (failureResetWindowElapsed && consecutiveProviderFailures >= MAX_CONSECUTIVE_FAILURES) {
++    state.consecutiveProviderFailures = 0
++    consecutiveProviderFailures = 0
++    log(`[${HOOK_NAME}] Reset consecutive provider failures after recovery window`, { sessionID, failureResetWindowMs: FAILURE_RESET_WINDOW_MS })
++  }
+ 
+-  if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+-    log(`[${HOOK_NAME}] Skipped: max consecutive failures reached`, { sessionID, consecutiveFailures: state.consecutiveFailures })
++  if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES || consecutiveProviderFailures >= MAX_CONSECUTIVE_FAILURES) {
++    log(`[${HOOK_NAME}] Skipped: max consecutive failures reached`, {
++      sessionID,
++      consecutiveFailures: state.consecutiveFailures,
++      consecutiveProviderFailures,
++    })
+     return
+   }
+ 
+   const effectiveCooldown =
+-    CONTINUATION_COOLDOWN_MS * 2 ** Math.min(state.consecutiveFailures, 5)
++    CONTINUATION_COOLDOWN_MS * 2 ** Math.min(Math.max(state.consecutiveFailures, consecutiveProviderFailures), 5)
+   if (state.lastInjectedAt && Date.now() - state.lastInjectedAt < effectiveCooldown) {
+-    log(`[${HOOK_NAME}] Skipped: cooldown active`, { sessionID, effectiveCooldown, consecutiveFailures: state.consecutiveFailures })
++    log(`[${HOOK_NAME}] Skipped: cooldown active`, {
++      sessionID,
++      effectiveCooldown,
++      consecutiveFailures: state.consecutiveFailures,
++      consecutiveProviderFailures,
++    })
+     return
+   }
+ 
+-- 
+2.55.0.windows.3
+

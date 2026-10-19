@@ -1,0 +1,87 @@
+From e7516468f1cbb9acfebd6fbfafe7659f5db43077 Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 29 Aug 2026 19:15:17 +0300
+Subject: [PATCH] fix_omo_preserve_provider_failure_streak
+
+(cherry picked from commit 604ec0a83300664617b7e92531d045c9348f9191)
+---
+ .../non-idle-events.test.ts                    | 18 ++++++++++++++++++
+ .../non-idle-events.ts                         |  5 +++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
+index 7b384251f..4b6df9a46 100644
+--- a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
++++ b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
+@@ -41,6 +41,24 @@ describe("handleNonIdleEvent", () => {
+     expect(state.tokenLimitDetected).toBe(true)
+   })
+ 
++  test("given a non-assistant message delta after a provider failure, preserves the provider failure streak", () => {
++    // given
++    const sessionID = "ses_provider_failure_delta"
++    const state = sessionStateStore.getState(sessionID)
++    state.awaitingPostInjectionProgressCheck = true
++    state.consecutiveProviderFailures = 1
++
++    // when
++    handleNonIdleEvent({
++      eventType: "message.part.delta",
++      properties: { sessionID, delta: "partial provider output" },
++      sessionStateStore,
++    })
++
++    // then
++    expect(state.consecutiveProviderFailures).toBe(1)
++  })
++
+   test("given internally marked user message update, keeps continuation countdown state intact", () => {
+     // given
+     const sessionID = "ses_internal_user_event"
+diff --git a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.ts b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+index 2003e9631..5a8b9df3c 100644
+--- a/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.ts
++++ b/packages/omo-opencode/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+@@ -53,6 +53,7 @@ function hasAcceptedContinuationLifecycle(state: SessionState): boolean {
+ function markContinuationResponseObserved(state: SessionState | undefined): void {
+   if (state?.awaitingPostInjectionProgressCheck === true) {
+     state.continuationResponseObserved = true
++    state.consecutiveProviderFailures = 0
+   }
+ }
+ 
+@@ -69,6 +70,7 @@ function pauseForGenuineUserInterruption(args: {
+   state.wasCancelled = false
+   state.tokenLimitDetected = false
+   state.unrecoverableErrorDetected = false
++  state.consecutiveProviderFailures = 0
+   sessionStateStore.cancelCountdown(sessionID)
+   log(`[${HOOK_NAME}] Paused continuation after genuine user interruption`, { sessionID })
+ }
+@@ -144,6 +146,7 @@ export function handleNonIdleEvent(args: {
+         state.wasCancelled = false
+         state.tokenLimitDetected = false
+         state.unrecoverableErrorDetected = false
++        state.consecutiveProviderFailures = 0
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+@@ -155,6 +158,7 @@ export function handleNonIdleEvent(args: {
+         markContinuationResponseObserved(state)
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        state.consecutiveProviderFailures = 0
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+@@ -211,6 +215,7 @@ export function handleNonIdleEvent(args: {
+         const info = properties?.info as Record<string, unknown> | undefined
+         if (info?.role === "assistant") {
+           markContinuationResponseObserved(state)
++          state.consecutiveProviderFailures = 0
+         }
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
+-- 
+2.55.0.windows.3
+

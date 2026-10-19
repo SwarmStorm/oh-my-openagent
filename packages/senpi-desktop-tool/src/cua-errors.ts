@@ -1,3 +1,5 @@
+import type { PermissionDeniedData } from "@oh-my-opencode/senpi-desktop-protocol";
+
 // Engine error codes and run failures as gajae-code's `COMPUTER_*` codes, each with its recovery hint.
 const ENGINE_TO_COMPUTER: Readonly<Record<string, string>> = {
 	Suspended: "COMPUTER_SUSPENDED",
@@ -9,6 +11,8 @@ const ENGINE_TO_COMPUTER: Readonly<Record<string, string>> = {
 	CursorRestoreFailed: "COMPUTER_CURSOR_RESTORE_FAILED",
 	FocusRestoreFailed: "COMPUTER_FOCUS_RESTORE_FAILED",
 	BackgroundUnavailable: "COMPUTER_BACKGROUND_UNAVAILABLE",
+	ControlRequired: "COMPUTER_CONTROL_REQUIRED",
+	InputBusy: "COMPUTER_INPUT_BUSY",
 	Cancelled: "COMPUTER_CANCELLED",
 	Timeout: "COMPUTER_CANCELLED",
 	timeout: "COMPUTER_CANCELLED",
@@ -27,7 +31,7 @@ function hint(code: string, stopHotkey: string): string | undefined {
 		case "COMPUTER_CANCELLED":
 			return waitForUser;
 		case "COMPUTER_PERMISSION_REQUIRED":
-			return "Grant Screen Recording and Accessibility to the app that launched senpi, then restart it.";
+			return "Do not retry until the user says the grant is done and the app was relaunched.";
 		case "COMPUTER_PERMISSION_DENIED":
 			return "A permission rule denied this action; do not retry it.";
 		case "COMPUTER_CURSOR_RESTORE_FAILED":
@@ -35,6 +39,10 @@ function hint(code: string, stopHotkey: string): string | undefined {
 			return "Input may have completed, but the previous state was not restored. Ask the user to inspect the desktop before retrying.";
 		case "COMPUTER_BACKGROUND_UNAVAILABLE":
 			return "This window cannot take background input; use the computer tool's accessibility actions instead.";
+		case "COMPUTER_CONTROL_REQUIRED":
+			return "Call desktop.control.acquire({ reason }) in computer run code (computer.control.acquire in an eval kernel) and let the human confirm before acting in the foreground; do not retry this action until that returns { active: true }.";
+		case "COMPUTER_INPUT_BUSY":
+			return "Another session holds the foreground control grant; it is never stolen, so continue in the background or retry once that session releases it.";
 		default:
 			return undefined;
 	}
@@ -43,10 +51,23 @@ function hint(code: string, stopHotkey: string): string | undefined {
 export interface ComputerFailure {
 	readonly code: string;
 	readonly message: string;
+	readonly permission?: PermissionDeniedData["permission"];
+	readonly settingsUrl?: string;
+	readonly app?: string;
+	readonly relaunchRequired?: boolean;
 }
 
-export function computerFailure(code: string, reason: string, stopHotkey: string): ComputerFailure {
+export function computerFailure(
+	code: string,
+	reason: string,
+	stopHotkey: string,
+	permission?: PermissionDeniedData | null,
+): ComputerFailure {
 	const mapped = code.startsWith("COMPUTER_") ? code : (ENGINE_TO_COMPUTER[code] ?? "COMPUTER_ERROR");
 	const recovery = hint(mapped, stopHotkey);
-	return { code: mapped, message: `${mapped}: ${reason}${recovery === undefined ? "" : ` ${recovery}`}` };
+	return {
+		code: mapped,
+		message: `${mapped}: ${reason}${recovery === undefined ? "" : ` ${recovery}`}`,
+		...(permission ?? {}),
+	};
 }

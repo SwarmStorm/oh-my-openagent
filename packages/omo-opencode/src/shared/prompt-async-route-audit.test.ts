@@ -49,10 +49,35 @@ const RAW_PROMPT_ALLOWLIST = new Map<string, string>([
     "binds SDK Session.promptAsync into a narrow facade consumed only by gate-routed unstable-agent-babysitter dispatch; performs no direct dispatch itself",
   ],
   [
+    path.join(SOURCE_ROOT, "plugin", "compaction-autocontinue-reroute.ts"),
+    "binds SDK Session.promptAsync into a narrow facade consumed only by the session-compacting auto-continue reissue, which must land as a pinned-model user turn immediately after compaction rather than through the internal-prompt queue the gate reserves",
+  ],
+  [
+    path.join(SOURCE_ROOT, "v2", "hook-bridge.ts"),
+    "OpenCode V2 host adapter: ctx.session.prompt is the v2 plugin-host session surface, not the v1 SDK client the shared gate wraps; dispatches the post-manual-compaction continue turn",
+  ],
+  [
+    path.join(SOURCE_ROOT, "v2", "project-config.ts"),
+    "OpenCode V2 host adapter: input.ctx.session.prompt executes v1 custom commands through the v2 plugin-host session API; the shared gate wraps only the v1 SDK client surface",
+  ],
+  [
     path.join(WORKSPACE_ROOT, "packages", "senpi-task", "src", "runners", "in-process", "child-handle.ts"),
     "drives a senpi CHILD AgentSession.prompt for spawned subagent turns; senpi-task cannot reach OpenCode session APIs (opencode-coupling audit) so the main-session injection invariant does not apply",
   ],
 ])
+
+// An allowlisted file is exempt from the shared-gate rule only for the raw prompt
+// accesses it had when it was reviewed. A new one changes the count and fails the
+// audit, so an exemption never silently covers unrelated future calls.
+const RAW_PROMPT_ALLOWLIST_ACCESSES: Record<string, number> = {
+  "plugin/event.ts": 0,
+  "plugin/build-team-idle-wake-hint-client.ts": 1,
+  "plugin/unstable-agent-babysitter.ts": 1,
+  "plugin/compaction-autocontinue-reroute.ts": 1,
+  "v2/hook-bridge.ts": 1,
+  "v2/project-config.ts": 1,
+  "../../senpi-task/src/runners/in-process/child-handle.ts": 1,
+}
 
 async function listSourceFiles(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true })
@@ -260,6 +285,22 @@ function detectRawPromptInSourceFile(sourceFile: ts.SourceFile): boolean {
   return detected
 }
 
+function countRawPromptInSourceFile(sourceFile: ts.SourceFile): number {
+  let count = 0
+
+  const visit = (node: ts.Node): void => {
+    const isRawPromptAccess = isRawPromptPropertyAccess(node) && !isTypeofPromptCheck(node)
+    if (isRawPromptAccess || isPromptBindingPattern(node) || isReflectApplyPromptCall(node)) {
+      count += 1
+    }
+
+    node.forEachChild(visit)
+  }
+
+  visit(sourceFile)
+  return count
+}
+
 async function detectRawPromptInSnippet(contents: string): Promise<boolean> {
   return detectRawPromptInSourceFile(await parseSnippet(contents))
 }
@@ -422,6 +463,25 @@ await dispatchInternalPrompt(options)
 
     // then
     expect(offenders).toEqual([])
+  })
+
+  test("#given allowlisted files #when their raw prompt accesses are counted #then each matches its reviewed count", async () => {
+    // given
+    const allowlisted = [...RAW_PROMPT_ALLOWLIST.keys()]
+    const parsedSourceFiles = await parser.parse(allowlisted)
+    const actual: Record<string, number> = {}
+
+    // when
+    for (const filePath of allowlisted) {
+      const sourceFile = parsedSourceFiles.get(filePath)
+      if (!sourceFile) {
+        throw new Error(`TypeScript did not parse ${filePath}`)
+      }
+      actual[relativeSourcePath(filePath).replaceAll("\\", "/")] = countRawPromptInSourceFile(sourceFile)
+    }
+
+    // then
+    expect(actual).toEqual(RAW_PROMPT_ALLOWLIST_ACCESSES)
   })
 
   test("#given production TypeScript sources #when prompt gate callers are audited #then callers cannot disable the post-dispatch reservation hold", async () => {
