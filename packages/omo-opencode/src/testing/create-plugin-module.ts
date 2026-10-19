@@ -140,6 +140,7 @@ function startupToastBody(input: {
   readonly error?: string
   readonly migratedFrom: readonly string[]
   readonly skippedConflictCount: number
+  readonly targetBackupPaths: readonly string[]
 }): Record<string, unknown> | undefined {
   const summary = input.migratedFrom.length === 0
     ? ""
@@ -148,10 +149,11 @@ function startupToastBody(input: {
     ? ""
     : ` Kept ${input.skippedConflictCount} existing value${input.skippedConflictCount === 1 ? "" : "s"}.`
   const diagnostics = input.diagnostics.length === 0 ? "" : ` ${input.diagnostics.join(" ")}`
+  const backups = input.targetBackupPaths.length === 0 ? "" : ` Previous config saved as ${input.targetBackupPaths.join(", ")}.`
   if (input.error !== undefined) {
-    return { title: "Configuration migration failed", message: `${input.error}${diagnostics}`, variant: "error" }
+    return { title: "Configuration migration failed", message: `${input.error}${backups}${diagnostics}`, variant: "error" }
   }
-  if (summary.length > 0) return { title: "Configuration migrated", message: `${summary}${conflicts}${diagnostics}`, variant: "success" }
+  if (summary.length > 0 || backups.length > 0) return { title: "Configuration migrated", message: `${summary}${conflicts}${backups}${diagnostics}`.trim(), variant: "success" }
   if (diagnostics.length > 0) return { title: "Configuration diagnostics", message: input.diagnostics.join(" "), variant: "warning" }
   return undefined
 }
@@ -165,6 +167,19 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
     deps.log("[oh-my-openagent] ENTRY - plugin loading", {
       directory: input.directory,
     })
+    // Per-phase setup timing (local fix 29, first-message-drop F16): makes the
+    // cold-start cost of every setup segment attributable in oh-my-opencode.log.
+    const setupTimings: Record<string, number> = {};
+    const setupStartedAt = Date.now();
+    let setupPhaseStartedAt = Date.now();
+    const markSetupPhase = (name: string): void => {
+      const now = Date.now();
+      setupTimings[name] = now - setupPhaseStartedAt;
+      setupPhaseStartedAt = now;
+    };
+    // Local fix 47: every plugin setup shares the backend's one event loop with all open sessions; yield
+    // between phases so no new chat folder holds it for the whole setup in one stretch.
+    const yieldSetupSlice = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
     deps.logLegacyPluginStartupWarning()
     deps.migrateLegacyWorkspaceDirectory(input.directory)
     startupMigration ??= deps.runOpenCodeStartupMigration({ cwd: input.directory })
@@ -175,6 +190,7 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
       journalResumed: startupMigration.journalResumed,
       migratedFrom: startupMigration.migratedFrom,
       skippedConflictCount: startupMigration.skippedConflictCount,
+      targetBackupPaths: startupMigration.targetBackupPaths,
     })
     if (startupMigration.error !== undefined) {
       console.warn(`[config-migration] legacy configuration changes were not applied: ${startupMigration.error}`)
@@ -184,7 +200,10 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
       ...(startupMigration.error === undefined ? {} : { error: startupMigration.error }),
       migratedFrom: startupMigration.migratedFrom,
       skippedConflictCount: startupMigration.skippedConflictCount,
+      targetBackupPaths: startupMigration.targetBackupPaths,
     })
+    markSetupPhase("startupMigrationAndValidation");
+    await yieldSetupSlice();
     if (toast !== undefined) showStartupToast(input.client, toast, deps.log)
 
     // Unconditional omo process hygiene (T16): fire-and-forget family sweep,
@@ -286,21 +305,28 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
 
     const modelCacheState = deps.createModelCacheState()
 
+    markSetupPhase("pluginInit");
+    await yieldSetupSlice();
     const managers = deps.createManagers({
       ctx: input,
       pluginConfig,
       tmuxConfig,
       modelCacheState,
       backgroundNotificationHookEnabled: isHookEnabled("background-notification"),
+      todoContinuationEnforcerEnabled: isHookEnabled("todo-continuation-enforcer"),
       runtimeSkillSourceUrl: runtimeSkillSource?.url,
     })
 
+    markSetupPhase("managers");
+    await yieldSetupSlice();
     const toolsResult = await deps.createTools({
       ctx: input,
       pluginConfig,
       managers,
     })
 
+    markSetupPhase("tools");
+    await yieldSetupSlice();
     const hooks = deps.createHooks({
       ctx: input,
       pluginConfig,
@@ -314,6 +340,8 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
       availableSkills: toolsResult.availableSkills,
     })
 
+    markSetupPhase("hooks");
+    await yieldSetupSlice();
     const pluginInterface = deps.createPluginInterface({
       ctx: input,
       pluginConfig,
@@ -335,13 +363,23 @@ export function createPluginModule(overrides: Partial<PluginModuleDeps> = {}): P
 
       "experimental.session.compacting": createSessionCompactingHandler(hooks),
 
-      "experimental.compaction.autocontinue": createCompactionAutocontinueHandler(hooks),
+      "experimental.compaction.autocontinue": createCompactionAutocontinueHandler(hooks, {
+        client: input.client,
+        directory: input.directory,
+      }),
 
       dispose: async (): Promise<void> => {
         runtimeSkillSource?.stop()
         await dispose()
       },
     }
+
+    markSetupPhase("interface");
+    setupTimings.total = Date.now() - setupStartedAt;
+    deps.log("[oh-my-openagent] setup phase timing", {
+      directory: input.directory,
+      ...setupTimings,
+    });
 
     return pluginHooks
   }

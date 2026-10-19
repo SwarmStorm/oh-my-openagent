@@ -58,7 +58,9 @@ function targetRoots(plans, agentDir, home) {
 
 async function planAll(runtime, agentDir) {
   const providerSource = planOpencodeProviders(runtime)
-  const credentials = await planCredentials(runtime, join(agentDir, "auth.json"), new Set(providerSource.providers.map((item) => item.id)))
+  // A provider the custom-provider stage described (carried or refused with its reason) is reported there only.
+  const described = new Set([...providerSource.providers.map((item) => item.id), ...providerSource.skipped])
+  const credentials = await planCredentials(runtime, join(agentDir, "auth.json"), described)
   const assets = planAssets({ runtime, agentDir })
   const providers = planProviders(providerSource, agentDir)
   const oauthProviders = opencodeOauthProviders(runtime)
@@ -94,7 +96,7 @@ export async function runSetup(args = process.argv.slice(2), options = {}) {
   const inventory = await detectHarnesses(runtime)
   const plans = await planAll(runtime, agentDir)
   if (dryRun) process.stdout.write("DRY RUN: no files will be written\n")
-  const categories = await setupCoverage({ agentDir, home, env, plans, loadRuntime: options.loadCoverageRuntime })
+  const categories = await setupCoverage({ agentDir, home, env, plans, loadRuntime: options.loadCoverageRuntime, loadEngine: options.loadCoverageEngine })
   process.stdout.write(formatSetupSummary({ home, agentDir, inventory, ...plans, categories }))
   process.stdout.write(`${TELEMETRY_NOTICE}\n`)
   if (dryRun) {

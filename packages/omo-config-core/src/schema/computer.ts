@@ -11,8 +11,13 @@ const nonNegativeInteger = z.number().int().nonnegative()
  */
 export const OmoComputerSettingsLayerSchema = z
   .object({
-    enabled: z.boolean(),
+    enabled: z
+      .boolean()
+      .describe(
+        "Experimental: register the computer tool in OmO Native sessions (default: on where the host is supported; false leaves it unregistered)",
+      ),
     display: z.string().min(1),
+    showCursor: z.boolean().describe("Show the display-only macOS cursor overlay (default: true; false hides it)"),
     max_width: positiveInteger,
     max_height: positiveInteger,
     screenshot_max_bytes: positiveInteger,
@@ -29,6 +34,9 @@ export const OmoComputerSettingsLayerSchema = z
   })
   .partial()
   .strict()
+  .describe(
+    "Experimental computer use in OmO Native: screenshots, windows, accessibility trees and native mouse and keyboard input. Every key is optional; defaults depend on the host.",
+  )
 
 export const OmoComputerSettingsSchema = OmoComputerSettingsLayerSchema
 
@@ -40,6 +48,7 @@ type ComputerSettingPath = `computer.${ComputerSettingKey}`
 export const COMPUTER_HARNESS_SUPPORT: Record<ComputerSettingPath, readonly OmoHarnessId[]> = {
   "computer.enabled": ["native"],
   "computer.display": ["native"],
+  "computer.showCursor": ["native"],
   "computer.max_width": ["native"],
   "computer.max_height": ["native"],
   "computer.screenshot_max_bytes": ["native"],

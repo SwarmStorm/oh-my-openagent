@@ -1,9 +1,16 @@
 import { createAutoRetryHelpers } from "./auto-retry"
 import { createChatMessageHandler } from "./chat-message-handler"
-import { DEFAULT_CONFIG } from "./constants"
+import { COMPACTION_WATCHDOG_BUDGET_MS, DEFAULT_CONFIG } from "./constants"
 import { createEventHandler } from "./event-handler"
 import { createFirstPromptWatchdog, observeEventForWatchdog } from "./first-prompt-watchdog"
 import { createMessageUpdateHandler } from "./message-update-handler"
+import { resolveSessionEventID } from "../../shared/event-session-id"
+import { clearAllCompactions, getCompaction, observeCompactionEvent } from "../../shared/compaction-in-flight"
+import { log } from "../../shared/logger"
+import {
+  registerRuntimeFallbackRecoveryOwner,
+  settleRuntimeFallbackRecoveryClaim,
+} from "../../shared/runtime-fallback-recovery"
 import type { HookDeps, RuntimeFallbackHook, RuntimeFallbackInterval, RuntimeFallbackOptions, RuntimeFallbackPluginInput, RuntimeFallbackTimeout } from "./types"
 
 declare function setInterval(callback: () => void, delay?: number): RuntimeFallbackInterval
@@ -57,6 +64,7 @@ export function createRuntimeFallbackHook(
     sessionFallbackTimeouts: new Map(),
     sessionStatusRetryKeys: new Map(),
     internallyAbortedSessions: new Set(),
+    fallbackExhaustionToastStates: new Map(),
   }
 
   const helpers = factories.createAutoRetryHelpers(deps)
@@ -67,6 +75,8 @@ export function createRuntimeFallbackHook(
 
   let cleanupInterval: RuntimeFallbackInterval | null = null
   let intervalStarted = false
+  const lastFallbackProgressRearm = new Map<string, number>()
+  const lastEndedRearm = new Map<string, number>()
 
   const ensureInterval = (): void => {
     if (intervalStarted) return
@@ -79,11 +89,81 @@ export function createRuntimeFallbackHook(
     }
   }
 
-  const eventHandler = async ({ event }: { event: { type: string; properties?: unknown } }) => {
+  const releaseRecoveryOwner = registerRuntimeFallbackRecoveryOwner()
+
+  // A session.error is recovered here when a retry dispatch is pending or awaiting its result. That covers
+  // an accepted retry and an error from a superseded generation that arrives while one is live; an error
+  // from the retry itself clears both sets before it is declined.
+  const ownsRecovery = (sessionID: string | undefined): boolean =>
+    sessionID !== undefined
+    && (deps.sessionRetryInFlight.has(sessionID) || deps.sessionAwaitingFallbackResult.has(sessionID))
+
+  const handleEvent = async ({ event }: { event: { type: string; properties?: unknown } }) => {
     ensureInterval()
+    observeCompactionEvent(event)
+
+    const messageUpdatedInfo = event.type === "message.updated"
+      && typeof event.properties === "object"
+      && event.properties !== null
+      && typeof (event.properties as Record<string, unknown>).info === "object"
+      && (event.properties as Record<string, unknown>).info !== null
+      ? (event.properties as Record<string, unknown>).info as Record<string, unknown>
+      : undefined
+    const messageUpdatedEnded = messageUpdatedInfo
+      && (messageUpdatedInfo.error !== undefined
+        || (typeof messageUpdatedInfo.time === "object"
+          && messageUpdatedInfo.time !== null
+          && (messageUpdatedInfo.time as Record<string, unknown>).completed !== undefined))
+    if (
+      event.type === "session.compacted"
+      || event.type === "session.compaction.ended"
+      || event.type === "session.compaction.failed"
+      || messageUpdatedEnded
+    ) {
+      const props = event.properties as Record<string, unknown> | undefined
+      const sessionID = resolveSessionEventID(props)
+      const compaction = sessionID ? getCompaction(sessionID) : undefined
+      const endedAt = compaction?.endedAt
+      if (sessionID && deps.sessionAwaitingFallbackResult.has(sessionID) && endedAt !== undefined
+        && lastEndedRearm.get(sessionID) !== endedAt) {
+        lastEndedRearm.set(sessionID, endedAt)
+        helpers.scheduleSessionFallbackTimeout(sessionID)
+      }
+    }
 
     if (config.enabled) {
       observeEventForWatchdog(event, firstPromptWatchdog)
+    }
+
+    if (event.type === "message.part.updated" || event.type === "message.part.delta") {
+      const props = event.properties as Record<string, unknown> | undefined
+      const sessionID = resolveSessionEventID(props) ?? resolveSessionEventID(
+        typeof props?.part === "object" && props.part !== null
+          ? props.part as Record<string, unknown>
+          : undefined,
+      )
+      if (sessionID && deps.sessionAwaitingFallbackResult.has(sessionID)) {
+        const lastRearm = lastFallbackProgressRearm.get(sessionID) ?? -Infinity
+        if (Date.now() - lastRearm >= 5_000) {
+          lastFallbackProgressRearm.set(sessionID, Date.now())
+          const compaction = getCompaction(sessionID)
+          const timeoutMs = options?.session_timeout_ms ?? config.timeout_seconds * 1000
+          const delayOverride = compaction && !compaction.endedAt
+            ? Math.max(0, Math.min(timeoutMs, COMPACTION_WATCHDOG_BUDGET_MS - (Date.now() - compaction.startedAt)))
+            : undefined
+          helpers.scheduleSessionFallbackTimeout(sessionID, undefined, delayOverride)
+          log(`[runtime-fallback] watchdog-part-progress-rearm`, { sessionID })
+        }
+      }
+    }
+
+    if (event.type === "session.deleted") {
+      const props = event.properties as Record<string, unknown> | undefined
+      const sessionID = resolveSessionEventID(props)
+      if (sessionID) {
+        lastFallbackProgressRearm.delete(sessionID)
+        lastEndedRearm.delete(sessionID)
+      }
     }
 
     if (event.type === "message.updated") {
@@ -95,7 +175,19 @@ export function createRuntimeFallbackHook(
     await baseEventHandler({ event })
   }
 
+  const eventHandler = async (input: { event: { type: string; properties?: unknown } }) => {
+    try {
+      await handleEvent(input)
+    } finally {
+      if (input.event.type === "session.error") {
+        const sessionID = resolveSessionEventID(input.event.properties as Record<string, unknown> | undefined)
+        settleRuntimeFallbackRecoveryClaim(input.event, ownsRecovery(sessionID) ? "retry-owned" : "declined")
+      }
+    }
+  }
+
   const dispose = () => {
+    releaseRecoveryOwner()
     if (cleanupInterval) {
       clearInterval(cleanupInterval)
     }
@@ -113,6 +205,11 @@ export function createRuntimeFallbackHook(
     deps.sessionFallbackTimeouts.clear()
     deps.sessionStatusRetryKeys.clear()
     deps.internallyAbortedSessions.clear()
+    deps.fallbackExhaustionToastStates?.clear()
+    lastFallbackProgressRearm.clear()
+    lastEndedRearm.clear()
+    // clearAllCompactions is process-wide by design; retain this cleanup until registry ownership is per hook.
+    clearAllCompactions()
   }
 
   return {

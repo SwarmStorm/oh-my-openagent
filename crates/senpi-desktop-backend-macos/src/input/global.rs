@@ -12,10 +12,23 @@ use core_graphics::geometry::CGPoint;
 use senpi_desktop_core::backend::PointerEvent;
 use senpi_desktop_core::error::{CoreResult, DesktopError};
 
-use super::cgevent::{button_types, click_group_id, finite_i32, modifier_flags, point};
+use super::cgevent::{button_types, click_group_id, modifier_flags, point, quartz_wheel};
 use super::held::{ButtonRoute, Held, HeldButton};
 
-pub(super) fn pointer(source: &CGEventSource, held: &mut Held, event: PointerEvent) -> CoreResult<()> {
+pub(super) fn pointer(
+    source: &CGEventSource,
+    held: &mut Held,
+    event: PointerEvent,
+    overlay: &crate::overlay::Overlay,
+) -> CoreResult<()> {
+    let start = match &event {
+        PointerEvent::Click { x, y, .. } | PointerEvent::Move { x, y }
+        | PointerEvent::Scroll { x, y, .. } => Some((*x, *y)),
+        PointerEvent::Drag { path, .. } => path.first().copied(),
+    };
+    if let Some((x, y)) = start {
+        overlay.target(x, y);
+    }
     match event {
         PointerEvent::Click {
             x,
@@ -100,6 +113,7 @@ pub(super) fn pointer(source: &CGEventSource, held: &mut Held, event: PointerEve
             post_global_mouse(source, down, cg_button, start_x, start_y, 1, number, flags)?;
             for &(x, y) in &path[1..] {
                 thread::sleep(Duration::from_millis(16));
+                overlay.target(x, y);
                 post_global_mouse(source, dragged, cg_button, x, y, 1, number, flags)?;
             }
             thread::sleep(Duration::from_millis(50));
@@ -123,8 +137,7 @@ pub(super) fn pointer(source: &CGEventSource, held: &mut Held, event: PointerEve
                 0,
                 CGEventFlags::CGEventFlagNull,
             )?;
-            let wheel_x = finite_i32(dx, "horizontal scroll delta")?;
-            let wheel_y = finite_i32(dy, "vertical scroll delta")?;
+            let (wheel_y, wheel_x) = quartz_wheel(dx, dy)?;
             let event =
                 CGEvent::new_scroll_event(source.clone(), ScrollEventUnit::PIXEL, 2, wheel_y, wheel_x, 0)
                     .map_err(|()| DesktopError::input_failed("failed to create a Quartz scroll event"))?;
@@ -138,7 +151,7 @@ pub(super) fn pointer(source: &CGEventSource, held: &mut Held, event: PointerEve
     clippy::too_many_arguments,
     reason = "the parameters are the native CGEvent fields posted together"
 )]
-fn post_global_mouse(
+pub(super) fn post_global_mouse(
     source: &CGEventSource,
     event_type: CGEventType,
     button: CGMouseButton,

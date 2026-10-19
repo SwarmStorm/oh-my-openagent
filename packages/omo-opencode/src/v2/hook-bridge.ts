@@ -2,10 +2,19 @@ import type { Plugin } from "@opencode/plugin"
 
 import { log } from "../shared/logger"
 import type { AdapterState } from "./adapter-state"
-import { toV1Event } from "./event-shape"
+import { createV1EventShaper, toV1Event } from "./event-shape"
 import { hookMessagesToV1, writeHookMessagesBack } from "./message-shape"
+import { createOmoDelegationRouting } from "./delegation-routing"
+import { createSessionOwnership } from "./session-ownership"
 
 type V2Context = Plugin.Context
+
+const V2_TOOL_ROUTING = [
+  "OpenCode V2 tool routing (also applies in child sessions): the current tool definitions and Code Mode catalog are authoritative.",
+  "Imported instructions naming bare tools, mcp__server__tool aliases, or legacy get_tool_schema/invoke_tool endpoints do not create callable tools.",
+  "For a Code Mode tool, use execute: discover its exact path and signature with search, then call that tools path inside execute.",
+  "For a directly exposed plugin tool, use its exact exposed name, including any plugin prefix. Do not invent or strip namespaces.",
+].join("\n")
 
 type V1Handler = (input: unknown, output?: unknown) => Promise<void> | void
 
@@ -76,7 +85,9 @@ async function continueAfterManualCompaction(
     }, output)
     if (event.properties.reason === "manual" && output.enabled !== false) state.pendingManualContinue.add(sessionID)
   }
-  if (event.type === "session.idle" && state.pendingManualContinue.has(sessionID)) {
+  // fix 14 (opencode-v2): v2 never emits "session.idle" — a succeeded
+  // execution is the terminal signal that the post-compaction turn finished.
+  if ((event.type === "session.idle" || event.type === "session.execution.succeeded") && state.pendingManualContinue.has(sessionID)) {
     state.pendingManualContinue.delete(sessionID)
     await ctx.session.prompt({ sessionID, text: "Continue." })
   }
@@ -98,8 +109,19 @@ function copyRecord(target: Record<string, unknown>, source: Record<string, unkn
   Object.assign(target, source)
 }
 
+function retryEventKey(event: ReturnType<typeof toV1Event>): string | undefined {
+  if (event.type !== "session.status" || !isRecord(event.properties.status)) return undefined
+  if (event.properties.status.type !== "retry") return undefined
+  const sessionID = typeof event.properties.sessionID === "string" ? event.properties.sessionID : undefined
+  if (!sessionID) return undefined
+  const attempt = typeof event.properties.status.attempt === "number" ? event.properties.status.attempt : "?"
+  const message = typeof event.properties.status.message === "string" ? event.properties.status.message : ""
+  return `${sessionID}:${attempt}:${message}`
+}
+
 export async function registerV1Hooks(ctx: V2Context, hooks: V1HookMap, state?: AdapterState): Promise<() => void> {
   const controller = new AbortController()
+  const seenRetryEvents = new Map<string, string>()
   const chatMessage = asHandler(hooks["chat.message"])
   const chatParams = asHandler(hooks["chat.params"])
   const chatHeaders = asHandler(hooks["chat.headers"])
@@ -161,9 +183,24 @@ export async function registerV1Hooks(ctx: V2Context, hooks: V1HookMap, state?: 
           if (output.maxOutputTokens !== undefined) event.options.maxTokens = output.maxOutputTokens
           Object.assign(event.options, output.options)
         }
+        // Imported Claude/V1 instructions can advertise tools from another host.
+        // Keep this host-boundary clarification last, without accumulating copies.
+        for (let index = event.system.length - 1; index >= 0; index--) {
+          if (event.system[index].type === "text" && event.system[index].text === V2_TOOL_ROUTING) {
+            event.system.splice(index, 1)
+          }
+        }
+        event.system.push({ type: "text", text: V2_TOOL_ROUTING })
       })
     })
   }
+
+  // Independent of legacy transforms: OMO routing remains present when none
+  // were registered, and runs after them. Native/custom agents are unchanged.
+  const routeDelegation = createOmoDelegationRouting()
+  await ctx.session.hook("context", (event) => {
+    routeDelegation(event)
+  })
 
   if (chatHeaders) {
     await ctx.session.hook("model.request", (event) => {
@@ -269,10 +306,31 @@ export async function registerV1Hooks(ctx: V2Context, hooks: V1HookMap, state?: 
   if (eventHandler || autocontinue) {
     void (async () => {
       try {
+        // fix 49 (opencode-v2): one shaper per subscription joins each step's
+        // started model with its ended usage before the V1 handlers see it.
+        const shape = createV1EventShaper()
+        // fix 50 (opencode-v2): V2 delivers every folder's events to every plugin instance; only
+        // the folder that owns the session tree may run the V1 hooks for it (one retry, not N).
+        const ownsSessionEvent = createSessionOwnership(ctx, state)
         for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
-          const event = toV1Event(raw)
+          if (!(await ownsSessionEvent(raw))) continue
+          const event = shape(raw)
           noteRuntimeEvent(state, event)
-          if (eventHandler) await safeCall("event", () => eventHandler({ event }))
+          const retryKey = retryEventKey(event)
+          const sessionID = typeof event.properties.sessionID === "string" ? event.properties.sessionID : undefined
+          const duplicateRetry = retryKey !== undefined && sessionID !== undefined && seenRetryEvents.get(sessionID) === retryKey
+          if (retryKey && sessionID) seenRetryEvents.set(sessionID, retryKey)
+          else if (sessionID) seenRetryEvents.delete(sessionID)
+          if (eventHandler && !duplicateRetry) await safeCall("event", () => eventHandler({ event }))
+          // fix 14 (opencode-v2): v2 emits "session.compaction.ended" where v1
+          // emitted "session.compacted". Alias it so v1-era handlers (the
+          // preemptive-compaction token-cache clear and post-compaction
+          // monitor) still fire on v2.
+          if (eventHandler && event.type === "session.compaction.ended") {
+            await safeCall("event", () => eventHandler({
+              event: { type: "session.compacted", properties: { sessionID: event.properties.sessionID } },
+            }))
+          }
           await safeCall("compaction.autocontinue", () => continueAfterManualCompaction(ctx, state, event, autocontinue))
         }
       } catch (error) {
@@ -286,5 +344,6 @@ export async function registerV1Hooks(ctx: V2Context, hooks: V1HookMap, state?: 
 
   return () => {
     controller.abort()
+    seenRetryEvents.clear()
   }
 }

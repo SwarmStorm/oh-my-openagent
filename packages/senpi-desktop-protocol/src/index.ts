@@ -5,6 +5,7 @@ export {
 	type ComputerCallPolicy,
 	type ComputerCallStep,
 	DESKTOP_METHODS,
+	DISPLAY_METHODS,
 	ELEMENT_METHODS,
 	isReadOnlyComputerCall,
 	WINDOW_METHODS,
@@ -32,6 +33,7 @@ export {
 	type JsonRpcVersion,
 	type MethodRejection,
 	type MethodRejectionData,
+	type PermissionDeniedData,
 	type RequestId,
 	STANDARD_RPC_ERRORS,
 } from "./json-rpc";

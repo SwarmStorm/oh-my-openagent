@@ -1,0 +1,47 @@
+From 580bcd5716e95c788fe7e42a77bd97b0eae56236 Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 12 Sep 2026 03:52:25 +0300
+Subject: [PATCH] fix(runtime-fallback): extend first prompt watchdog
+
+(cherry picked from commit 109859a7a8e1d5e7786b9307109dcf50fd4690d8)
+---
+ .../omo-opencode/src/hooks/runtime-fallback/constants.ts     | 2 +-
+ .../src/hooks/runtime-fallback/first-prompt-watchdog.test.ts | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/packages/omo-opencode/src/hooks/runtime-fallback/constants.ts b/packages/omo-opencode/src/hooks/runtime-fallback/constants.ts
+index 8b5d997d5..782564fa5 100644
+--- a/packages/omo-opencode/src/hooks/runtime-fallback/constants.ts
++++ b/packages/omo-opencode/src/hooks/runtime-fallback/constants.ts
+@@ -40,4 +40,4 @@ export const HOOK_NAME = "runtime-fallback"
+  * practice) yet much shorter than the 30-minute outer poll timeout that
+  * would otherwise be the only safety net.
+  */
+-export const DEFAULT_FIRST_PROMPT_WATCHDOG_MS = 90_000
++export const DEFAULT_FIRST_PROMPT_WATCHDOG_MS = 180_000
+diff --git a/packages/omo-opencode/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts b/packages/omo-opencode/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+index de14e254d..18612cf1e 100644
+--- a/packages/omo-opencode/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
++++ b/packages/omo-opencode/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+ import type { HookDeps, RuntimeFallbackPluginInput } from "./types"
+ import type { AutoRetryHelpers } from "./auto-retry"
+ import { subagentSessions } from "../../features/claude-code-session-state"
++import { DEFAULT_FIRST_PROMPT_WATCHDOG_MS } from "./constants"
+ import { createFirstPromptWatchdog, observeEventForWatchdog, type FirstPromptWatchdog } from "./first-prompt-watchdog"
+ 
+ const WATCHDOG_MS = 100
+@@ -155,6 +156,10 @@ const PLUGIN_CONFIG_WITH_FALLBACK = {
+ describe("first-prompt-watchdog", () => {
+   let fakeTimers: FakeTimers | undefined
+ 
++  it("uses a three-minute default so slow first tokens can arrive before fallback", () => {
++    expect(DEFAULT_FIRST_PROMPT_WATCHDOG_MS).toBe(180_000)
++  })
++
+   function getFakeTimers(): FakeTimers {
+     if (!fakeTimers) {
+       throw new Error("Fake timers must be installed before advancing watchdog time")
+-- 
+2.55.0.windows.3
+

@@ -7,7 +7,7 @@
 use image::RgbaImage;
 
 use crate::ax::{AxHandle, AxProps};
-use crate::error::{CoreResult, DesktopError};
+use crate::error::{CoreResult, DesktopError, TccPermission};
 use crate::frame::FrameGeometry;
 use crate::keys::KeyName;
 use crate::types::{
@@ -86,10 +86,31 @@ pub enum PointerEvent {
 }
 
 pub trait Backend: Send {
+    /// Independent release ownership, usable without borrowing a busy backend.
+    /// Owners register this before admitting input into bounded fatal-stop mode.
+    fn emergency_release(&self) -> Option<std::sync::Arc<dyn EmergencyRelease>> {
+        None
+    }
+
+    fn permission_denied(&mut self, _permission: TccPermission) -> DesktopError {
+        DesktopError::permission_denied("input permission is not granted")
+    }
+
     fn capabilities(&mut self) -> DesktopCapabilities;
+
+    /// Updates the display-only virtual cursor without changing admission.
+    fn set_show_cursor(&mut self, _enabled: bool) {}
+
     fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>>;
     fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>>;
-    fn capture(&mut self, target: &Target, caps: &CaptureCaps) -> CoreResult<(RgbaImage, FrameGeometry)>;
+    /// Captures `target`. `exclude_window_titles` names windows a display
+    /// capture must leave out; backends without exclusion support ignore it.
+    fn capture(
+        &mut self,
+        target: &Target,
+        caps: &CaptureCaps,
+        exclude_window_titles: &[String],
+    ) -> CoreResult<(RgbaImage, FrameGeometry)>;
     fn pointer(
         &mut self,
         target: &Target,
@@ -98,6 +119,16 @@ pub trait Backend: Send {
         mode: DeliveryMode,
     ) -> CoreResult<()>;
     fn type_text(&mut self, target: &Target, text: &str, mode: DeliveryMode) -> CoreResult<()>;
+    /// The system clipboard's text. Backends without clipboard access keep
+    /// this default and refuse instead of pretending.
+    fn clipboard_read(&mut self) -> CoreResult<String> {
+        Err(DesktopError::internal("this desktop backend has no clipboard access"))
+    }
+
+    /// Replaces the system clipboard's text.
+    fn clipboard_write(&mut self, _text: &str) -> CoreResult<()> {
+        Err(DesktopError::internal("this desktop backend has no clipboard access"))
+    }
     /// Backends with incremental text delivery check between Unicode scalars
     /// and report each fully delivered scalar. The default preserves the
     /// existing one-call behavior for backends without incremental input.
@@ -117,7 +148,52 @@ pub trait Backend: Send {
         Ok(())
     }
     fn key_chord(&mut self, target: &Target, keys: &[KeyName], mode: DeliveryMode) -> CoreResult<()>;
+    /// Native press/release around a session-owned interruptible wait.
+    /// Backends without bounded input refuse rather than synthesizing clicks.
+    fn hold_keys(
+        &mut self,
+        _target: &Target,
+        _keys: &[KeyName],
+        _mode: DeliveryMode,
+        _control: &crate::holds::HoldControl<'_>,
+    ) -> CoreResult<()> {
+        Err(DesktopError::input_failed("bounded key holds are unavailable on this backend"))
+    }
+
+    fn hold_mouse(
+        &mut self,
+        _target: &Target,
+        _hold: &crate::holds::MouseHold<'_>,
+        _mode: DeliveryMode,
+        _control: &crate::holds::HoldControl<'_>,
+    ) -> CoreResult<()> {
+        Err(DesktopError::input_failed("bounded mouse holds are unavailable on this backend"))
+    }
     fn raise_window(&mut self, id: &str) -> CoreResult<()>;
+
+    /// The immediate children of `window`'s menu at `path` (empty = the menu
+    /// bar). Backends without menus yet refuse with `AxUnsupported`.
+    fn menu_items(&mut self, _window: &DesktopWindow, _path: &[String]) -> CoreResult<Vec<crate::menus::MenuItem>> {
+        Err(DesktopError::ax_unsupported())
+    }
+
+    /// Invokes the leaf command `path` names in `window`'s menu. Backends
+    /// call `check_stop` at every menu level they open and immediately before
+    /// the native press, so a stop chord or cancel landing mid-walk dispatches
+    /// nothing. `delivery` is the session-admitted mode: background keys the
+    /// window without raising it; foreground raises and keys it (the session
+    /// admits foreground only under the control grant). Backends without menus
+    /// yet refuse with `AxUnsupported`.
+    fn menu_select(
+        &mut self,
+        _window: &DesktopWindow,
+        _path: &[String],
+        _delivery: DeliveryMode,
+        _check_stop: &dyn Fn() -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        Err(DesktopError::ax_unsupported())
+    }
+
     fn ax(&mut self) -> Option<&mut dyn AxBackend>;
 
     /// Releases every button and key this backend may still hold down.
@@ -156,6 +232,20 @@ pub trait Backend: Send {
     }
 }
 
+/// Replays only tracked downs. Must not wait for the backend's input scope.
+pub trait EmergencyRelease: Send + Sync {
+    fn release_all(&self) -> CoreResult<()>;
+}
+
+/// The native window that owns an accessibility element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxOwner {
+    /// The owner's id, in the form [`Backend::windows`] lists it.
+    Window(String),
+    /// The backend cannot name the owner; callers must not guess it.
+    Unknown,
+}
+
 pub trait AxBackend {
     fn window_root(&mut self, win: &DesktopWindow) -> CoreResult<AxHandle>;
     fn props(&mut self, h: &AxHandle) -> CoreResult<AxProps>;
@@ -167,6 +257,13 @@ pub trait AxBackend {
     fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>>;
     fn focused_element(&mut self) -> CoreResult<Option<AxHandle>>;
     fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>>;
+
+    /// The window that owns `h`, read live from the platform and named as
+    /// `windows` (the live [`Backend::windows`]) lists it. Backends that
+    /// cannot name it keep this default.
+    fn owner(&mut self, _h: &AxHandle, _windows: &[DesktopWindow]) -> CoreResult<AxOwner> {
+        Ok(AxOwner::Unknown)
+    }
 }
 
 #[cfg(test)]

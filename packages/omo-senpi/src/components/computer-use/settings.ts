@@ -1,10 +1,11 @@
 import type { OmoComputerSettings } from "@oh-my-opencode/omo-config-core"
-import { type ComputerSettings, type ComputerSettingsInput, resolveComputerSettings } from "@oh-my-opencode/senpi-desktop-tool"
+import { type ComputerSettings, type ComputerSettingsInput, resolveComputerSettings } from "@oh-my-opencode/senpi-desktop-tool/registration"
 
 export function toComputerSettingsInput(block: OmoComputerSettings | undefined): ComputerSettingsInput | undefined {
   if (block === undefined) return undefined
   const input: Record<string, unknown> = {
     enabled: block.enabled,
+    showCursor: block.showCursor,
     display: block.display,
     maxWidth: block.max_width,
     maxHeight: block.max_height,

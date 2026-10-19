@@ -79,43 +79,76 @@ function storedMessage(message: Record<string, unknown>, sessionID: string): V1M
   }
 }
 
+// OpenCode 2 stores a tool call as { type: "tool", id, name, state }. The v1 hook code reads the
+// OpenCode 1 part fields `tool` and `callID` (transcripts, tool-pair repair, context-window pruning),
+// so the read-only session view carries both spellings. The hook message view is left alone: it is
+// written back to the host, which must not receive fields it never stored.
+function withV1ToolFields(message: V1Message): V1Message {
+  if (message.info.role !== "assistant") return message
+  return {
+    ...message,
+    parts: message.parts.map((part) =>
+      part.type === "tool"
+        ? {
+            ...part,
+            ...(part.tool === undefined && typeof part.name === "string" ? { tool: part.name } : {}),
+            ...(part.callID === undefined && typeof part.id === "string" ? { callID: part.id } : {}),
+          }
+        : part,
+    ),
+  }
+}
+
 export function storedMessagesToV1(messages: unknown, sessionID: string): V1Message[] {
   if (!Array.isArray(messages)) return []
   const view: V1Message[] = []
   for (const message of messages) {
     if (!isRecord(message)) continue
     const translated = storedMessage(message, sessionID)
-    if (translated) view.push(translated)
+    if (translated) view.push(withV1ToolFields(translated))
   }
   return view
 }
 
+// The message each v1 view was made from. Transforms insert, drop and reorder views, so edits are
+// written back to the message a view came from, never to whatever sits at the view's index.
+const viewSources = new WeakMap<V1Message, unknown>()
+
+function hookMessageToV1(message: unknown, sessionID: string): V1Message {
+  if (!isRecord(message)) {
+    return { info: { sessionID, role: "user" }, parts: textPart("") }
+  }
+  if (typeof message.type === "string" && message.role === undefined) {
+    return storedMessage(message, sessionID) ?? { info: { sessionID, role: "user" }, parts: textPart("") }
+  }
+  return {
+    info: {
+      id: message.id,
+      sessionID,
+      role: message.role,
+      ...(message.agent !== undefined ? { agent: message.agent } : {}),
+      ...(message.model !== undefined ? { model: message.model } : {}),
+    },
+    parts: Array.isArray(message.content) ? partsFromContent(message.content) : partsFromContent(message.parts),
+  }
+}
+
 export function hookMessagesToV1(messages: readonly unknown[], sessionID: string): V1Message[] {
   return messages.map((message) => {
-    if (!isRecord(message)) {
-      return { info: { sessionID, role: "user" }, parts: textPart("") }
-    }
-    if (typeof message.type === "string" && message.role === undefined) {
-      return storedMessage(message, sessionID) ?? { info: { sessionID, role: "user" }, parts: textPart("") }
-    }
-    return {
-      info: {
-        id: message.id,
-        sessionID,
-        role: message.role,
-        ...(message.agent !== undefined ? { agent: message.agent } : {}),
-        ...(message.model !== undefined ? { model: message.model } : {}),
-      },
-      parts: Array.isArray(message.content) ? partsFromContent(message.content) : partsFromContent(message.parts),
-    }
+    const view = hookMessageToV1(message, sessionID)
+    viewSources.set(view, message)
+    return view
   })
 }
 
 export function writeHookMessagesBack<T>(original: readonly T[], edited: readonly V1Message[]): T[] {
-  return edited.map((message, index) => {
-    const current = original[index]
+  const written = new Set<T>()
+  return edited.map((message) => {
+    const source = viewSources.get(message) as T | undefined
+    const current = source !== undefined && original.includes(source) && !written.has(source) ? source : undefined
     const content = contentFromParts(message.parts)
-    if (isRecord(current) && Array.isArray(current.content)) {
+    if (current !== undefined && isRecord(current) && Array.isArray(current.content)) {
+      written.add(current)
       current.content.splice(0, current.content.length, ...content)
       return current
     }

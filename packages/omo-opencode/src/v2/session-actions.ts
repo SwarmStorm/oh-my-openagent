@@ -1,6 +1,10 @@
+import { resolve } from "node:path"
+
 import { storedMessagesToV1 } from "./message-shape"
 import type { AdapterState } from "./adapter-state"
 import { SessionHttpError } from "./serve-http"
+import { AGENT_RECOVERY_PROMPT } from "../hooks/compaction-context-injector/constants"
+import { log } from "../shared/logger"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -26,6 +30,33 @@ function textFromPrompt(input: unknown): string {
     .map((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : ""))
     .filter((text) => text.length > 0)
     .join("\n")
+}
+
+export type PromptFile = { uri: string; name?: string; description?: string }
+
+// V1 callers (look_at, delegate-task) attach images and documents as `{ type: "file", url, filename }` parts.
+// V2 takes them as `files: [{ uri, name }]` and materializes `file:` and `data:` URIs at prompt admission.
+export function filesFromPrompt(input: unknown): PromptFile[] {
+  const body = bodyOf(input)
+  const files: PromptFile[] = []
+  const add = (uri: unknown, name: unknown, description?: unknown) => {
+    if (typeof uri !== "string" || uri.length === 0) return
+    files.push({
+      uri,
+      ...(typeof name === "string" && name.length > 0 ? { name } : {}),
+      ...(typeof description === "string" && description.length > 0 ? { description } : {}),
+    })
+  }
+  if (Array.isArray(body.files)) {
+    for (const file of body.files) if (isRecord(file)) add(file.uri, file.name, file.description)
+  }
+  if (Array.isArray(body.parts)) {
+    for (const part of body.parts) {
+      if (!isRecord(part) || part.type !== "file") continue
+      add(typeof part.url === "string" ? part.url : part.uri, typeof part.filename === "string" ? part.filename : part.name)
+    }
+  }
+  return files
 }
 
 function promptDelivery(input: unknown): "steer" | "queue" | undefined {
@@ -62,15 +93,16 @@ function toolDenies(value: unknown): Array<{ action: string; resource: string; e
 type SessionApi = {
   get: (input: { sessionID: string }) => Promise<Record<string, unknown>>
   context: (input: { sessionID: string }) => Promise<unknown>
-  prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<unknown>
+  prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue"; files?: PromptFile[] }) => Promise<unknown>
   create: (input: Record<string, unknown>) => Promise<Record<string, unknown>>
   interrupt: (input: { sessionID: string }) => Promise<unknown>
   switchAgent: (input: { sessionID: string; agent: string }) => Promise<unknown>
   switchModel: (input: { sessionID: string; model: { id: string; providerID: string; variant?: string } }) => Promise<unknown>
-  synthetic: (input: { sessionID: string; text: string }) => Promise<unknown>
+  synthetic: (input: { sessionID: string; text: string; resume?: boolean }) => Promise<unknown>
   update: (input: { sessionID: string; permissions?: Array<{ action: string; resource: string; effect: "allow" | "deny" | "ask" }> }) => Promise<unknown>
   remove?: (input: { sessionID: string }) => Promise<unknown>
   compact?: (input: { sessionID: string }) => Promise<unknown>
+  move?: (input: { sessionID: string; directory: string }) => Promise<unknown>
 }
 
 export function withParent(session: Record<string, unknown>, state: AdapterState): Record<string, unknown> {
@@ -82,9 +114,17 @@ export function withParent(session: Record<string, unknown>, state: AdapterState
   return parentID ? { ...session, parentID, directory: directoryOf(session) } : { ...session, directory: directoryOf(session) }
 }
 
-function directoryOf(session: Record<string, unknown>): unknown {
+export function directoryOf(session: Record<string, unknown>): unknown {
   if (typeof session.directory === "string") return session.directory
   return isRecord(session.location) ? session.location.directory : undefined
+}
+
+export function sameDirectory(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    const resolved = resolve(value).replaceAll("\\", "/").replace(/\/+$/, "")
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved
+  }
+  return normalize(left) === normalize(right)
 }
 
 export function childSessions(sessions: Array<Record<string, unknown>>, parentID: string, state: AdapterState): Array<Record<string, unknown>> {
@@ -106,15 +146,25 @@ export async function createSession(api: SessionApi, input: unknown, state: Adap
   }
   const model = modelRef(body.model, body.variant)
   const permissions = permissionsFrom(body.permission)
+  const requestedDirectory = typeof query.directory === "string" ? query.directory : directory
   const created = await api.create({
+    ...(parentID ? { parentID } : {}),
     ...(typeof body.title === "string" ? { title: body.title } : {}),
     ...(typeof body.agent === "string" ? { agent: body.agent } : {}),
     ...(model ? { model } : {}),
-    ...(typeof query.directory === "string" ? { location: { directory: query.directory } } : { location: { directory } }),
+    location: { directory: requestedDirectory },
     ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     ...(permissions.length > 0 ? { permissions } : {}),
   })
-  const session = withParent(isRecord(created) ? created : {}, state)
+  let record = isRecord(created) ? created : {}
+  const placed = directoryOf(record)
+  // The native host creates a child at its parent's location, so a child asked to run elsewhere is moved after creation.
+  if (parentID && typeof record.id === "string" && typeof placed === "string" && !sameDirectory(placed, requestedDirectory) && api.move) {
+    await api.move({ sessionID: record.id, directory: requestedDirectory })
+    const location = { ...(isRecord(record.location) ? record.location : {}), directory: requestedDirectory }
+    record = typeof record.directory === "string" ? { ...record, directory: requestedDirectory, location } : { ...record, location }
+  }
+  const session = withParent(record, state)
   if (typeof session.id === "string" && parentID) state.recordParent(session.id, parentID)
   if (typeof session.id === "string") state.noteSession(session)
   return session
@@ -130,8 +180,20 @@ export async function sendPrompt(api: SessionApi, input: unknown): Promise<unkno
   if (typeof body.system === "string" && body.system.length > 0) await api.synthetic({ sessionID, text: body.system })
   const denies = toolDenies(body.tools)
   if (denies.length > 0) await api.update({ sessionID, permissions: denies })
+  const text = textFromPrompt(input)
+  const files = filesFromPrompt(input)
+  if (body.noReply === true) {
+    // V2 configuration is persistent control-plane state. The v1 recovery
+    // sentinel is not a user request or context for the model/tool bridge.
+    if (text.startsWith(AGENT_RECOVERY_PROMPT) && text.includes("<!-- OMO_INTERNAL_NOREPLY -->")) {
+      return api.get({ sessionID })
+    }
+    // Synthetic context has no attachment field; say so instead of losing the files silently.
+    if (files.length > 0) log("[oh-my-openagent] v2 noReply prompt cannot carry attachments; files not delivered", { sessionID, files: files.map((file) => file.name ?? file.uri.slice(0, 64)) })
+    return api.synthetic({ sessionID, text, resume: false })
+  }
   const delivery = promptDelivery(input)
-  return api.prompt({ sessionID, text: textFromPrompt(input), ...(delivery ? { delivery } : {}) })
+  return api.prompt({ sessionID, text, ...(delivery ? { delivery } : {}), ...(files.length > 0 ? { files } : {}) })
 }
 
 export async function readMessages(api: SessionApi, input: unknown): Promise<ReturnType<typeof storedMessagesToV1>> {

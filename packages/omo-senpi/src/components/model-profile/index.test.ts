@@ -1,8 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, spyOn, test } from "bun:test"
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { existsSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import type { OmoConfig } from "@oh-my-opencode/omo-config-core"
@@ -16,6 +15,7 @@ import {
   MODEL_PROFILE_UNAVAILABLE_TYPE,
   MODEL_PROFILE_UNKNOWN_TYPE,
 } from "./index"
+import { testTempDir } from "../../../test-support/temp-dir"
 
 type FakeModel = { readonly provider: string; readonly id: string }
 
@@ -25,6 +25,8 @@ const KIMI: FakeModel = { provider: "moonshotai", id: "kimi-k3" }
 const GLM: FakeModel = { provider: "zai", id: "glm-5.3" }
 const SOL: FakeModel = { provider: "github-copilot", id: "gpt-6-sol" }
 const SOL_56_COPILOT: FakeModel = { provider: "github-copilot", id: "gpt-5.6-sol" }
+const SOL_61: FakeModel = { provider: "chatgpt-subscription", id: "gpt-6.1-sol" }
+const SOL_61_FAST: FakeModel = { provider: "chatgpt-subscription", id: "gpt-6.1-sol-fast" }
 const SOL_FAST: FakeModel = { provider: "chatgpt-subscription", id: "gpt-6-sol-fast" }
 const ASTRA: FakeModel = { provider: "chatgpt-subscription", id: "gpt-6-astra" }
 const UNRELATED: FakeModel = { provider: "example", id: "nothing-in-any-chain" }
@@ -114,7 +116,7 @@ function harness(
 ) {
   const pi = new FakeExtensionAPI()
   const logs: string[] = []
-  const agentDir = mkdtempSync(join(tmpdir(), "omo-model-profile-"))
+  const agentDir = testTempDir("omo-model-profile-")
   createModelProfileComponent({
     loadConfig: () => ({ config, diagnostics: [], layers: [], sources: [] }),
   }).register(pi, context(logs))
@@ -150,7 +152,7 @@ describe("createModelProfileComponent", () => {
     }
   })
 
-  test("#given model_profile unset #when the session starts #then the recommended ladder is applied", async () => {
+  test("#given model_profile unset #when the session starts #then Daily · Normal is applied", async () => {
     const { pi, start } = harness({})
 
     await start(STARTUP)
@@ -161,20 +163,20 @@ describe("createModelProfileComponent", () => {
     expect(pi.messages[0]?.message).toMatchObject({
       customType: MODEL_PROFILE_APPLIED_TYPE,
       display: true,
-      details: { profile: "recommended", model: "anthropic/claude-opus-5-5", reasoning: "medium", skipped: [] },
+      details: { profile: "daily-normal", model: "anthropic/claude-opus-5-5", reasoning: "medium", skipped: [] },
     })
-    expect(appliedContent(pi)).toContain('"recommended" (Recommended)')
+    expect(appliedContent(pi)).toContain('"daily-normal" (Daily · Normal)')
     expect(appliedContent(pi)).toContain("anthropic/claude-opus-5-5 medium")
   })
 
-  test("#given a blank model_profile #when the session starts #then the recommended ladder is applied", async () => {
+  test("#given a blank model_profile #when the session starts #then Daily · Normal is applied", async () => {
     const { pi, start } = harness({ model_profile: "   " })
 
     await start(STARTUP)
 
     expect(pi.sessionModels).toEqual([OPUS])
     expect(pi.sessionThinkingLevels).toEqual(["medium"])
-    expect(pi.messages[0]?.message).toMatchObject({ customType: MODEL_PROFILE_APPLIED_TYPE, details: { profile: "recommended" } })
+    expect(pi.messages[0]?.message).toMatchObject({ customType: MODEL_PROFILE_APPLIED_TYPE, details: { profile: "daily-normal" } })
   })
 
   test("#given unset and Opus only through a gateway aggregator #when the session starts #then the gateway is skipped and kimi max is applied", async () => {
@@ -185,7 +187,7 @@ describe("createModelProfileComponent", () => {
     expect(pi.sessionModels).toEqual([CODING_KIMI])
     expect(pi.sessionThinkingLevels).toEqual(["max"])
     expect(pi.messages[0]?.message).toMatchObject({
-      details: { profile: "recommended", model: "kimi-coding/kimi-k3", reasoning: "max" },
+      details: { profile: "daily-normal", model: "kimi-coding/kimi-k3", reasoning: "max" },
     })
   })
 
@@ -198,12 +200,87 @@ describe("createModelProfileComponent", () => {
     expect(pi.sessionThinkingLevels).toEqual(["medium"])
   })
 
-  test("#given daily-normal and Opus only through a gateway #when the session starts #then the lane keeps its cross-provider fallback", async () => {
+  test("#given unset with GPT-6.1 Sol and GPT-6 Sol connected beside GLM #when the session starts #then Daily · Normal's GLM rung is applied", async () => {
+    const { pi, start } = harness({}, [SOL, SOL_61, GLM, UNRELATED])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([GLM])
+    expect(pi.sessionThinkingLevels).toEqual(["max"])
+    expect(pi.messages[0]?.message).toMatchObject({
+      details: { profile: "daily-normal", model: "zai/glm-5.3", reasoning: "max" },
+    })
+  })
+
+  test("#given unset with only the ChatGPT subscription #when the session starts #then the first lane that resolves, Geeky · Normal, is applied", async () => {
+    const { pi, start } = harness({}, [SOL_61, UNRELATED])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([SOL_61])
+    expect(pi.sessionThinkingLevels).toEqual(["medium"])
+    expect(pi.messages[0]?.message).toMatchObject({
+      details: { profile: "geeky-normal", model: "chatgpt-subscription/gpt-6.1-sol", reasoning: "medium" },
+    })
+  })
+
+  // Migration contract (#10029): a saved `recommended` starts the unset default, logged once, never unknown.
+  test("#given a saved retired recommended model_profile #when two sessions start #then each applies the unset default and the retirement is logged once", async () => {
+    const { pi, logs, start } = harness({ model_profile: "recommended" }, [SOL, SOL_61, GLM, UNRELATED])
+
+    await start(STARTUP, "session-1")
+    await start(STARTUP, "session-2")
+
+    expect(pi.sessionModels).toEqual([GLM, GLM])
+    expect(pi.messages.map((entry) => entry.message["customType"])).toEqual([
+      MODEL_PROFILE_APPLIED_TYPE,
+      MODEL_PROFILE_APPLIED_TYPE,
+    ])
+    expect(pi.messages[0]?.message).toMatchObject({ details: { profile: "daily-normal", model: "zai/glm-5.3" } })
+    expect(logs.filter((line) => line.includes('model_profile "recommended" is retired'))).toHaveLength(1)
+  })
+
+  test("#given the user's own model_profiles entry named recommended #when the session starts #then that profile applies", async () => {
+    const { pi, logs, start } = harness(
+      { model_profile: "recommended", model_profiles: { recommended: { models: ["zai/glm-5.3"] } } },
+      [OPUS, GLM],
+    )
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([GLM])
+    expect(pi.messages[0]?.message).toMatchObject({ details: { profile: "recommended", model: "zai/glm-5.3" } })
+    expect(logs.some((line) => line.includes("is retired"))).toBe(false)
+  })
+
+  test("#given unset with only Copilot GPT-6 Sol and GLM #when the session starts #then Daily · Normal's GLM rung is applied", async () => {
+    const { pi, start } = harness({}, [SOL, GLM, UNRELATED])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([GLM])
+    expect(pi.sessionThinkingLevels).toEqual(["max"])
+    expect(pi.messages[0]?.message).toMatchObject({
+      details: { profile: "daily-normal", model: "zai/glm-5.3", reasoning: "max" },
+    })
+  })
+
+  test("#given daily-normal and Opus only through a gateway #when the session starts #then the lane skips the gateway for its next listed rung", async () => {
     const { pi, start } = harness({ model_profile: "daily-normal" }, [GATEWAY_OPUS, CODING_KIMI])
 
     await start(STARTUP)
 
-    expect(pi.sessionModels).toEqual([GATEWAY_OPUS])
+    expect(pi.sessionModels).toEqual([CODING_KIMI])
+  })
+
+  test("#given daily-normal and only a gateway serving its models #when the session starts #then the session model is kept with one unavailable notice", async () => {
+    const { pi, start } = harness({ model_profile: "daily-normal" }, [GATEWAY_OPUS])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([])
+    expect(pi.messages).toHaveLength(1)
+    expect(pi.messages[0]?.message).toMatchObject({ customType: MODEL_PROFILE_UNAVAILABLE_TYPE, display: true })
   })
 
   test("#given daily-normal with only the third rung #when the session starts #then kimi max is applied and skipped rungs are named", async () => {
@@ -240,6 +317,26 @@ describe("createModelProfileComponent", () => {
     expect(appliedContent(pi)).toContain("anthropic/claude-fable-5-1 xhigh")
   })
 
+  test("#given geeky-normal with GPT-6.1 Sol Fast and GPT-6.1 Sol connected #when the session starts #then gpt-6.1-sol-fast medium is applied", async () => {
+    const { pi, start } = harness({ model_profile: "geeky-normal" }, [SOL_61, SOL_61_FAST, SOL_56_COPILOT, UNRELATED])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([SOL_61_FAST])
+    expect(pi.sessionThinkingLevels).toEqual(["medium"])
+    expect(appliedContent(pi)).toContain("chatgpt-subscription/gpt-6.1-sol-fast medium")
+  })
+
+  test("#given geeky-normal without the GPT-6.1 Sol Fast tier #when the session starts #then plain gpt-6.1-sol medium is applied", async () => {
+    const { pi, start } = harness({ model_profile: "geeky-normal" }, [SOL_56_COPILOT, SOL_61, UNRELATED])
+
+    await start(STARTUP)
+
+    expect(pi.sessionModels).toEqual([SOL_61])
+    expect(pi.sessionThinkingLevels).toEqual(["medium"])
+    expect(appliedContent(pi)).toContain("chatgpt-subscription/gpt-6.1-sol medium")
+  })
+
   test("#given geeky-normal with only Copilot GPT-5.6 Sol #when the session starts #then gpt-5.6-sol medium is applied", async () => {
     const { pi, start } = harness({ model_profile: "geeky-normal" }, [SOL_56_COPILOT, SOL, UNRELATED])
 
@@ -250,14 +347,14 @@ describe("createModelProfileComponent", () => {
     expect(appliedContent(pi)).toContain("github-copilot/gpt-5.6-sol medium")
   })
 
-  test("#given geeky-heavy #when the session starts #then astra xhigh is applied", async () => {
+  test("#given geeky-heavy #when the session starts #then astra high is applied", async () => {
     const { pi, start } = harness({ model_profile: "geeky-heavy" }, [ASTRA, SOL_FAST])
 
     await start(STARTUP)
 
     expect(pi.sessionModels).toEqual([ASTRA])
-    expect(pi.sessionThinkingLevels).toEqual(["xhigh"])
-    expect(appliedContent(pi)).toContain("chatgpt-subscription/gpt-6-astra xhigh")
+    expect(pi.sessionThinkingLevels).toEqual(["high"])
+    expect(appliedContent(pi)).toContain("chatgpt-subscription/gpt-6-astra high")
   })
 
   test("#given a literal provider/model #when the session starts #then that pin is applied for the session", async () => {
@@ -299,7 +396,7 @@ describe("createModelProfileComponent", () => {
     expect(pi.messages).toHaveLength(1)
     expect(pi.messages[0]?.message).toMatchObject({
       customType: MODEL_PROFILE_UNKNOWN_TYPE,
-      content: 'OmO Native: model_profile "turbo" is not defined; known profiles: daily-heavy, daily-normal, geeky-heavy, geeky-normal, recommended',
+      content: 'OmO Native: model_profile "turbo" is not defined; known profiles: daily-heavy, daily-normal, geeky-heavy, geeky-normal',
     })
   })
 
@@ -412,7 +509,7 @@ describe("createModelProfileComponent", () => {
     expect(pi.messages).toHaveLength(1)
     expect(pi.messages[0]?.message).toMatchObject({ customType: MODEL_PROFILE_APPLIED_TYPE })
     const details = pi.messages[0]?.message["details"] as Record<string, unknown>
-    expect(details).toMatchObject({ profile: "recommended", model: "zai/glm-5.3", reasoning: "max" })
+    expect(details).toMatchObject({ profile: "daily-normal", model: "zai/glm-5.3", reasoning: "max" })
     expect(details["authFailed"]).toEqual([{ provider: "anthropic", model: "claude-opus-5-5", reason: "refresh" }])
     expect(appliedContent(pi)).toContain("re-authenticate anthropic in Provider authentication settings")
     expect(appliedContent(pi)).not.toContain("/login")
@@ -464,7 +561,7 @@ describe("createModelProfileComponent", () => {
     expect(pi.messages).toHaveLength(1)
     expect(pi.messages[0]?.message).toMatchObject({ customType: MODEL_PROFILE_UNAVAILABLE_TYPE })
     expect(pi.messages[0]?.message["details"]).toEqual({
-      profile: "recommended",
+      profile: "daily-normal",
       authFailed: [
         { provider: "anthropic", model: "claude-opus-5-5", reason: "refresh" },
         { provider: "moonshotai", model: "kimi-k3", reason: "refresh" },
@@ -475,17 +572,17 @@ describe("createModelProfileComponent", () => {
     expect(appliedContent(pi)).not.toContain(PRIVATE_MARKER)
   })
 
-  test("#given one model whose request configuration fails on a provider whose credentials resolve #when the session starts #then only that model is skipped and its sibling is applied", async () => {
+  test("#given one model whose request configuration fails on a provider whose credentials resolve #when the session starts #then only that model is skipped and the lane's next rung is applied", async () => {
     const probe = authProbe({ broken: ["anthropic/claude-opus-5-5"] })
     const { pi, logs, start } = harness({}, [OPUS, FABLE, GLM], probe.getAuth)
 
     await start(STARTUP)
 
-    expect(pi.sessionModels).toEqual([FABLE])
-    expect(pi.sessionThinkingLevels).toEqual(["xhigh"])
-    expect(probe.calls).toEqual(["anthropic", "anthropic/claude-opus-5-5", "anthropic", "anthropic/claude-fable-5-1"])
+    expect(pi.sessionModels).toEqual([GLM])
+    expect(pi.sessionThinkingLevels).toEqual(["max"])
+    expect(probe.calls).toEqual(["anthropic", "anthropic/claude-opus-5-5", "zai", "zai/glm-5.3"])
     expect(pi.messages[0]?.message["details"]).toMatchObject({
-      model: "anthropic/claude-fable-5-1",
+      model: "zai/glm-5.3",
       authFailed: [{ provider: "anthropic", model: "claude-opus-5-5", reason: "request" }],
     })
     expect(appliedContent(pi)).toContain("skipped anthropic/claude-opus-5-5: its request configuration did not resolve")
@@ -643,7 +740,7 @@ describe("model profile diagnostics through the composed default logger", () => 
         {
           mode: "print",
           cwd: "/project",
-          agentDir: mkdtempSync(join(tmpdir(), "omo-model-profile-composed-")),
+          agentDir: testTempDir("omo-model-profile-composed-"),
           modelRegistry: registry([OPUS, GLM, KIMI], probe.getAuth),
           sessionManager: { getSessionId: () => "session-composed" },
         },

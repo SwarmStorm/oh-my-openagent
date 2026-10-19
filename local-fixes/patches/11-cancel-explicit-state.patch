@@ -1,0 +1,26 @@
+From f6b43a05a059ced7d4761a3a7adf0da358e04b95 Mon Sep 17 00:00:00 2001
+From: "Mohamed R. Khalil" <m.radwan.khalil@gmail.com>
+Date: Sat, 12 Sep 2026 03:51:53 +0300
+Subject: [PATCH] fix(background-agent): track explicit cancellation state
+
+(cherry picked from commit 3e73c1cc47a37a9a670b241c8d70d08e4320fc63)
+---
+ packages/omo-opencode/src/features/background-agent/types.ts | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/packages/omo-opencode/src/features/background-agent/types.ts b/packages/omo-opencode/src/features/background-agent/types.ts
+index ea219315d..483a18040 100644
+--- a/packages/omo-opencode/src/features/background-agent/types.ts
++++ b/packages/omo-opencode/src/features/background-agent/types.ts
+@@ -95,6 +95,8 @@ export interface BackgroundTask {
+   /** ID of the currently active attempt */
+   currentAttemptID?: string
+ 
++  cancellationRequested?: boolean
++
+   /** Last message count for stability detection */
+   lastMsgCount?: number
+   /** Number of consecutive polls with stable message count */
+-- 
+2.55.0.windows.3
+
